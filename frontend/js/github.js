@@ -95,59 +95,76 @@ async function _fetchEncryptedDB(owner, repo, branch, token) {
   return { data: new Uint8Array(buffer), commitSha, compressed };
 }
 
-async function _pushEncryptedDB(
-  owner, repo, branch, token, bytes, parentSha,
-  message = "Update database via web editor"
-) {
-  const hdrs = { ..._ghHeaders(token), "Content-Type": "application/json" };
-
-  // 1) Create blob
-  const base64 = _uint8ToBase64(bytes);
-  const blobRes = await fetch(`${_GH_API}/repos/${owner}/${repo}/git/blobs`, {
-    method: "POST", headers: hdrs,
-    body: JSON.stringify({ content: base64, encoding: "base64" }),
-  });
-  if (!blobRes.ok) throw new Error(`Failed to create blob: ${blobRes.status}`);
-  const blobSha = (await blobRes.json()).sha;
-
-  // 2) Create tree
-  const treeRes = await fetch(`${_GH_API}/repos/${owner}/${repo}/git/trees`, {
-    method: "POST", headers: hdrs,
-    body: JSON.stringify({
-      tree: [{ path: "data/icourse.db.gz.enc", mode: "100644", type: "blob", sha: blobSha }],
-    }),
-  });
-  if (!treeRes.ok) throw new Error(`Failed to create tree: ${treeRes.status}`);
-  const treeSha = (await treeRes.json()).sha;
-
-  // 3) Create commit
-  const commitRes = await fetch(`${_GH_API}/repos/${owner}/${repo}/git/commits`, {
-    method: "POST", headers: hdrs,
-    body: JSON.stringify({ message, tree: treeSha, parents: [parentSha] }),
-  });
-  if (!commitRes.ok) throw new Error(`Failed to create commit: ${commitRes.status}`);
-  const newCommitSha = (await commitRes.json()).sha;
-
-  // 4) Update ref
-  const refRes = await fetch(
-    `${_GH_API}/repos/${owner}/${repo}/git/refs/heads/${branch}`,
-    { method: "PATCH", headers: hdrs, body: JSON.stringify({ sha: newCommitSha }) }
+async function _fetchBlobBytes(owner, repo, blobSha, token) {
+  const res = await fetch(
+    `${_GH_API}/repos/${owner}/${repo}/git/blobs/${blobSha}`,
+    {
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github.raw",
+      },
+    }
   );
-  if (refRes.status === 422) {
-    throw new Error("Conflict: the database was updated by another source. Please refresh and try again.");
-  }
-  if (!refRes.ok) throw new Error(`Failed to update ref: ${refRes.status}`);
-  return newCommitSha;
+  if (!res.ok) throw new Error(`Failed to download blob ${blobSha}: ${res.status}`);
+  const buffer = await res.arrayBuffer();
+  return new Uint8Array(buffer);
 }
 
-function _uint8ToBase64(bytes) {
-  const CHUNK = 0x8000;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
-    binary += String.fromCharCode.apply(null, slice);
+async function _fetchShardManifest(owner, repo, branch, token) {
+  // Walk the data branch tree to find icourse-index.enc + every shard file.
+  // Returns:
+  //   { commitSha, format: "sharded" | "legacy",
+  //     index?: { sha, name },          // sharded only
+  //     shards?: [{ name, sha, size }], // sharded only
+  //     legacy?: { name, sha, compressed } }  // legacy only
+  const commitSha = await _getLatestCommitSha(owner, repo, branch, token);
+
+  const commitRes = await fetch(
+    `${_GH_API}/repos/${owner}/${repo}/git/commits/${commitSha}`,
+    { headers: _ghHeaders(token) }
+  );
+  if (!commitRes.ok) throw new Error(`Failed to get commit: ${commitRes.status}`);
+  const treeSha = (await commitRes.json()).tree.sha;
+
+  const treeRes = await fetch(
+    `${_GH_API}/repos/${owner}/${repo}/git/trees/${treeSha}?recursive=1`,
+    { headers: _ghHeaders(token) }
+  );
+  if (!treeRes.ok) throw new Error(`Failed to get tree: ${treeRes.status}`);
+  const tree = (await treeRes.json()).tree;
+
+  const indexEntry = tree.find((e) => e.path === "data/icourse-index.enc");
+  if (indexEntry) {
+    const shards = tree
+      .filter((e) => e.type === "blob" && e.path.startsWith("data/shards/"))
+      .map((e) => ({
+        name: e.path.slice("data/shards/".length),
+        sha: e.sha,
+        size: e.size,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return {
+      commitSha,
+      format: "sharded",
+      index: { sha: indexEntry.sha, name: "icourse-index.enc" },
+      shards,
+    };
   }
-  return btoa(binary);
+
+  // Legacy fallback (single-file format)
+  const gz = tree.find((e) => e.path === "data/icourse.db.gz.enc");
+  const raw = tree.find((e) => e.path === "data/icourse.db.enc");
+  const legacy = gz || raw;
+  if (!legacy) throw new Error("Database not found on data branch.");
+  return {
+    commitSha,
+    format: "legacy",
+    legacy: {
+      name: legacy.path.slice("data/".length),
+      sha: legacy.sha,
+      compressed: !!gz,
+    },
+  };
 }
 
 async function _triggerExportWorkflow(
@@ -195,6 +212,7 @@ window.ICS.github = {
   detectRepo: _detectRepo,
   getLatestCommitSha: _getLatestCommitSha,
   fetchEncryptedDB: _fetchEncryptedDB,
-  pushEncryptedDB: _pushEncryptedDB,
+  fetchBlobBytes: _fetchBlobBytes,
+  fetchShardManifest: _fetchShardManifest,
   triggerExportWorkflow: _triggerExportWorkflow,
 };

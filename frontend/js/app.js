@@ -26,30 +26,12 @@ async function _gunzip(compressedBytes) {
   return result;
 }
 
-async function _gzip(bytes) {
-  var cs = new CompressionStream("gzip");
-  var writer = cs.writable.getWriter();
-  writer.write(bytes);
-  writer.close();
-  var chunks = [];
-  var reader = cs.readable.getReader();
-  while (true) {
-    var r = await reader.read();
-    if (r.done) break;
-    chunks.push(r.value);
-  }
-  var total = chunks.reduce(function(s, c) { return s + c.length; }, 0);
-  var result = new Uint8Array(total);
-  var offset = 0;
-  for (var i = 0; i < chunks.length; i++) {
-    result.set(chunks[i], offset);
-    offset += chunks[i].length;
-  }
-  return result;
-}
-
-/* ── IndexedDB cache for encrypted DB (avoid re-downloading 20MB+ every load) ── */
-var _idbName = "ics_cache";
+/* ── IndexedDB cache for decrypted shards (keyed by git blob sha) ────
+   Shard contents are content-addressed: a shard's git blob sha changes
+   only when its bytes change, so we can keep decrypted bytes around and
+   skip the network + decrypt + decompress chain on subsequent loads.
+*/
+var _idbName = "ics_cache_v2";
 
 function _idbOpen() {
   return new Promise(function(resolve, reject) {
@@ -113,6 +95,64 @@ function _highlightSnippet(text, query, radius) {
   return snip.replace(re, "<mark>$1</mark>");
 }
 
+/* ── Sharded loading helpers ── */
+async function _loadShard(owner, repo, entry, password, token) {
+  // Hit cache first; on miss download → decrypt → gunzip and store the
+  // decompressed sqlite bytes (~4× compression ratio, well under IndexedDB
+  // quota for typical class sizes).
+  var cacheKey = "shard:" + entry.sha;
+  var cached = await _idbGet(cacheKey);
+  if (cached) return cached;
+
+  var encBytes = await ICS.github.fetchBlobBytes(owner, repo, entry.sha, token);
+  var gzipped = await ICS.crypto.decrypt(
+    encBytes, password, ICS.crypto.NEW_ITERATIONS,
+  );
+  var dbBytes = await _gunzip(gzipped);
+  await _idbPut(cacheKey, dbBytes);
+  return dbBytes;
+}
+
+async function _loadFromShardManifest(manifest, owner, repo, password, token, progress) {
+  // 1) Fetch + decrypt the index (small, never cached)
+  var indexEnc = await ICS.github.fetchBlobBytes(
+    owner, repo, manifest.index.sha, token,
+  );
+  var indexBytes = await ICS.crypto.decrypt(
+    indexEnc, password, ICS.crypto.NEW_ITERATIONS,
+  );
+  var index = JSON.parse(new TextDecoder().decode(indexBytes));
+
+  // 2) Pull every shard (cache hits short-circuit, so only changed shards
+  //    actually download) and merge them into one in-memory DB.
+  await ICS.db.initEmpty();
+  var total = (index.shards || []).length;
+  for (var i = 0; i < total; i++) {
+    var shardMeta = index.shards[i];
+    var entry = manifest.shards.find(function (s) { return s.name === shardMeta.name; });
+    if (!entry) {
+      console.warn("Shard listed in index but missing from tree:", shardMeta.name);
+      continue;
+    }
+    if (progress) progress(i + 1, total, shardMeta.name);
+    var shardBytes = await _loadShard(owner, repo, entry, password, token);
+    await ICS.db.attachShard(shardBytes);
+  }
+}
+
+async function _loadFromLegacyBlob(manifest, owner, repo, secrets, token) {
+  // Single-file fallback for users still on the pre-shard data branch.
+  var encBytes = await ICS.github.fetchBlobBytes(
+    owner, repo, manifest.legacy.sha, token,
+  );
+  var fallback = await ICS.crypto.decryptWithFallback(encBytes, secrets);
+  var bytes = fallback.data;
+  if (manifest.legacy.compressed) {
+    bytes = await _gunzip(bytes);
+  }
+  await ICS.db.initDB(bytes);
+}
+
 /* ── Alpine app ── */
 document.addEventListener("alpine:init", () => {
   Alpine.data("app", () => ({
@@ -121,14 +161,13 @@ document.addEventListener("alpine:init", () => {
     courses: [], lectures: [],
     currentCourse: null, currentLecture: null,
     searchQuery: "", searchResults: [],
-    editText: "", editPreview: false, saving: false,
     showTranscript: false,
     commitSha: null,
     setup: { token: "", stuid: "", uispsw: "", dashscope: "", smtp: "" },
     setupError: "", setupTesting: false,
     settingsForm: {}, showSecrets: {},
     exportDialogOpen: false, exportSelection: {}, exportingPdf: false,
-    iterations: 10000, repoOwner: "", repoName: "", dataBranch: "data",
+    iterations: 100000, repoOwner: "", repoName: "", dataBranch: "data",
     _history: [],
 
     async init() {
@@ -137,7 +176,7 @@ document.addEventListener("alpine:init", () => {
       this.repoOwner = s.owner || (detected?.owner ?? "");
       this.repoName = s.repo || (detected?.repo ?? "");
       this.dataBranch = s.branch || "data";
-      this.iterations = s.iterations || 10000;
+      this.iterations = s.iterations || 100000;
       const creds = _loadCreds();
       if (!creds) { this.view = "setup"; return; }
       await this._loadDB(creds);
@@ -147,40 +186,26 @@ document.addEventListener("alpine:init", () => {
       this.view = "loading"; this.error = null;
       try {
         this.loadingMsg = "Checking for updates...";
-        var remoteSha = await ICS.github.getLatestCommitSha(
-          this.repoOwner, this.repoName, this.dataBranch, creds.token
+        var manifest = await ICS.github.fetchShardManifest(
+          this.repoOwner, this.repoName, this.dataBranch, creds.token,
         );
+        this.commitSha = manifest.commitSha;
 
-        // Check IndexedDB cache
-        var cached = await _idbGet("db_cache");
-        if (cached && cached.sha === remoteSha) {
-          this.loadingMsg = "Loading cached data...";
-          this.commitSha = remoteSha;
-          await ICS.db.initDB(cached.dbBytes);
-          ICS.db.ensureSchema();
-          this.courses = ICS.db.getCourses();
-          this.view = "courses";
-          return;
+        if (manifest.format === "sharded") {
+          var pw = await ICS.crypto.buildPasswordV2(creds);
+          var self = this;
+          await _loadFromShardManifest(
+            manifest, this.repoOwner, this.repoName, pw, creds.token,
+            function (i, n, name) {
+              self.loadingMsg = "Loading shard " + i + "/" + n + " (" + name + ")...";
+            },
+          );
+        } else {
+          this.loadingMsg = "Loading legacy database...";
+          await _loadFromLegacyBlob(
+            manifest, this.repoOwner, this.repoName, creds, creds.token,
+          );
         }
-
-        this.loadingMsg = "Downloading database...";
-        const { data, commitSha, compressed } = await ICS.github.fetchEncryptedDB(
-          this.repoOwner, this.repoName, this.dataBranch, creds.token
-        );
-        this.commitSha = commitSha;
-        this.loadingMsg = "Decrypting...";
-        var pw = ICS.crypto.buildPassword(creds);
-        var decrypted = await ICS.crypto.decrypt(data, pw, this.iterations);
-        if (compressed) {
-          this.loadingMsg = "Decompressing...";
-          decrypted = await _gunzip(decrypted);
-        }
-        this.loadingMsg = "Loading data...";
-        await ICS.db.initDB(decrypted);
-        ICS.db.ensureSchema();
-
-        // Cache the decrypted DB bytes for next load
-        await _idbPut("db_cache", { sha: commitSha, dbBytes: decrypted });
 
         this.courses = ICS.db.getCourses();
         this.view = "courses";
@@ -204,7 +229,6 @@ document.addEventListener("alpine:init", () => {
         this.lectures = ICS.db.getLectures(params.courseId);
       }
       else if (view === "detail" && params.subId) { this.currentLecture = ICS.db.getLecture(params.subId); this.showTranscript = false; }
-      else if (view === "edit") { this.editText = this.currentLecture?.summary || ""; this.editPreview = false; }
       this.view = view;
       if (view !== "lectures") this.exportDialogOpen = false;
     },
@@ -216,8 +240,16 @@ document.addEventListener("alpine:init", () => {
 
     openCourse(id) { this.navigate("lectures", { courseId: id }); },
     openLecture(id) { this.navigate("detail", { subId: id }); },
-    startEdit() { this.navigate("edit"); },
+
+    // Editing (manual summary edits) was retired when the data branch moved
+    // to a sharded layout — the frontend can no longer push back a single
+    // monolithic encrypted DB, and the workflow is the source of truth.
+    // Stubs keep the existing buttons in the template from throwing until
+    // subproject D removes them entirely.
+    editText: "", editPreview: false, saving: false,
+    startEdit() { this._toast("摘要编辑已下线，请等待新版前端", "error"); },
     cancelEdit() { this.goBack(); },
+    saveEdit() { this._toast("摘要编辑已下线", "error"); },
 
     getExportableLectures() {
       return (this.lectures || []).filter((lec) => lec.summary && lec.summary.trim());
@@ -286,30 +318,6 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
-    async saveEdit() {
-      if (this.saving) return;
-      this.saving = true;
-      try {
-        const creds = _loadCreds();
-        if (!creds) throw new Error("Not authenticated");
-        ICS.db.updateSummary(this.currentLecture.sub_id, this.editText);
-        var dbBytes = ICS.db.exportDB();
-        var pw = ICS.crypto.buildPassword(creds);
-        var compressed = await _gzip(dbBytes);
-        var enc = await ICS.crypto.encrypt(compressed, pw, this.iterations);
-        const sha = await ICS.github.getLatestCommitSha(this.repoOwner, this.repoName, this.dataBranch, creds.token);
-        this.commitSha = await ICS.github.pushEncryptedDB(
-          this.repoOwner, this.repoName, this.dataBranch, creds.token, enc, sha
-        );
-        // Update cache with new DB state
-        await _idbPut("db_cache", { sha: this.commitSha, dbBytes: ICS.db.exportDB() });
-        this.currentLecture = ICS.db.getLecture(this.currentLecture.sub_id);
-        this.goBack();
-        this._toast("Saved successfully", "success");
-      } catch (e) { this._toast(e.message, "error"); }
-      finally { this.saving = false; }
-    },
-
     _searchTimeout: null,
     doSearch() {
       clearTimeout(this._searchTimeout);
@@ -326,14 +334,25 @@ document.addEventListener("alpine:init", () => {
     async testAndSave() {
       this.setupTesting = true; this.setupError = "";
       try {
-        const { data, commitSha, compressed } = await ICS.github.fetchEncryptedDB(
-          this.repoOwner, this.repoName, this.dataBranch, this.setup.token
+        var manifest = await ICS.github.fetchShardManifest(
+          this.repoOwner, this.repoName, this.dataBranch, this.setup.token,
         );
-        var decrypted = await ICS.crypto.decrypt(data, ICS.crypto.buildPassword(this.setup), this.iterations);
-        if (compressed) decrypted = await _gunzip(decrypted);
+        if (manifest.format === "sharded") {
+          // Probe the index decryption to validate creds before we save.
+          var pw = await ICS.crypto.buildPasswordV2(this.setup);
+          var indexEnc = await ICS.github.fetchBlobBytes(
+            this.repoOwner, this.repoName, manifest.index.sha, this.setup.token,
+          );
+          await ICS.crypto.decrypt(indexEnc, pw, ICS.crypto.NEW_ITERATIONS);
+        } else {
+          var encBytes = await ICS.github.fetchBlobBytes(
+            this.repoOwner, this.repoName, manifest.legacy.sha, this.setup.token,
+          );
+          await ICS.crypto.decryptWithFallback(encBytes, this.setup);
+        }
         _saveCreds({ ...this.setup });
         _saveSettings({ owner: this.repoOwner, repo: this.repoName, branch: this.dataBranch, iterations: this.iterations });
-        this.commitSha = commitSha;
+        this.commitSha = manifest.commitSha;
         await this._loadDB({ ...this.setup });
       } catch (e) { this.setupError = e.message; }
       finally { this.setupTesting = false; }

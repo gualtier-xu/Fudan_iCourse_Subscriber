@@ -52,26 +52,40 @@ jobs:
       - name: Fetch database from data branch
         run: |
           mkdir -p data
-          if curl -fL -o data/icourse.db.gz.enc.tmp \
-               "https://raw.githubusercontent.com/${{ github.repository }}/data/data/icourse.db.gz.enc" 2>/dev/null; then
-            mv data/icourse.db.gz.enc.tmp data/icourse.db.gz.enc
-            echo "Loaded compressed database."
-          elif curl -fL -o data/icourse.db.enc.tmp \
-               "https://raw.githubusercontent.com/${{ github.repository }}/data/data/icourse.db.enc" 2>/dev/null; then
-            mv data/icourse.db.enc.tmp data/icourse.db.enc
-            echo "Loaded legacy database."
+          git fetch origin data --depth=1
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            mkdir -p data/sharded/shards
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
+          elif git cat-file -e origin/data:data/icourse.db.gz.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
+            echo "Loaded legacy compressed database."
+          elif git cat-file -e origin/data:data/icourse.db.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
+            echo "Loaded legacy uncompressed database."
           else
             echo "::error::No database found on data branch."
             exit 1
           fi
 
-      - name: Decrypt database
+      - name: Decode database
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
+          if [ -f data/sharded/icourse-index.enc ]; then
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+            echo "Reassembled sharded database."
+            exit 0
+          fi
+
           NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
           LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
 

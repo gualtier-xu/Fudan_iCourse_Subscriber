@@ -1,32 +1,96 @@
 /**
- * sql.js wrapper — load, query, and export the iCourse SQLite database.
- * Sets window.ICS.db global.
+ * sql.js wrapper — load lecture data from sharded encrypted shards.
+ *
+ * In the sharded layout (current), each shard is a self-contained sqlite
+ * file holding only the courses + lectures + ppt_pages rows for the courses
+ * it owns. The page reassembles them in-memory by copying every shard's
+ * rows into a single working SQL.Database. This avoids ATTACH'ing across
+ * sql.js DB instances — sql.js doesn't support cross-file ATTACH cleanly,
+ * and the row-count is small enough that copying is instantaneous.
  */
 
 window.ICS = window.ICS || {};
 
 const _SQL_CDN = "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0";
 let _db = null;
+let _SQL = null;
 
-async function _initDB(dbBytes) {
-  const SQL = await window.initSqlJs({
+const _SCHEMA = `
+CREATE TABLE IF NOT EXISTS courses (
+    course_id TEXT PRIMARY KEY,
+    title TEXT,
+    teacher TEXT
+);
+CREATE TABLE IF NOT EXISTS lectures (
+    sub_id TEXT PRIMARY KEY,
+    course_id TEXT NOT NULL,
+    sub_title TEXT, date TEXT,
+    transcript TEXT, summary TEXT,
+    processed_at TEXT, emailed_at TEXT,
+    error_msg TEXT, error_count INTEGER DEFAULT 0,
+    error_stage TEXT, summary_model TEXT,
+    summary_format_version INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ppt_pages (
+    sub_id TEXT NOT NULL,
+    page_num INTEGER NOT NULL,
+    created_sec INTEGER NOT NULL,
+    pptimgurl TEXT,
+    text TEXT,
+    ocr_status TEXT NOT NULL DEFAULT 'pending',
+    ocr_at TEXT,
+    PRIMARY KEY (sub_id, page_num)
+);
+`;
+
+async function _ensureSqlJs() {
+  if (_SQL) return _SQL;
+  _SQL = await window.initSqlJs({
     locateFile: (file) => `${_SQL_CDN}/${file}`,
   });
-  _db = dbBytes ? new SQL.Database(dbBytes) : new SQL.Database();
+  return _SQL;
 }
 
-function _ensureSchema() {
-  if (!_db) return;
-  const existing = new Set(
-    (_db.exec("PRAGMA table_info(lectures)")[0]?.values || []).map((r) => r[1])
+async function _initFromBytes(dbBytes) {
+  // Legacy path — accepts a single monolithic sqlite file.
+  // Kept so older deployments (pre-shard data branch) still load.
+  const SQL = await _ensureSqlJs();
+  _db = dbBytes ? new SQL.Database(dbBytes) : new SQL.Database();
+  if (!dbBytes) _db.exec(_SCHEMA);
+}
+
+async function _initEmpty() {
+  const SQL = await _ensureSqlJs();
+  _db = new SQL.Database();
+  _db.exec(_SCHEMA);
+}
+
+function _copyRows(src, dst, table) {
+  const result = src.exec(`SELECT * FROM ${table}`);
+  if (!result.length || !result[0].values.length) return;
+  const cols = result[0].columns;
+  const placeholders = cols.map(() => "?").join(",");
+  const stmt = dst.prepare(
+    `INSERT OR IGNORE INTO ${table} (${cols.join(",")}) VALUES (${placeholders})`
   );
-  for (const [col, typedef] of [
-    ["error_msg", "TEXT"],
-    ["error_count", "INTEGER DEFAULT 0"],
-    ["error_stage", "TEXT"],
-    ["summary_model", "TEXT"],
-  ]) {
-    if (!existing.has(col)) _db.run(`ALTER TABLE lectures ADD COLUMN ${col} ${typedef}`);
+  for (const row of result[0].values) {
+    stmt.bind(row);
+    stmt.step();
+    stmt.reset();
+  }
+  stmt.free();
+}
+
+async function _attachShard(shardBytes) {
+  if (!_db) throw new Error("Database not initialized");
+  const SQL = await _ensureSqlJs();
+  const shard = new SQL.Database(shardBytes);
+  try {
+    _copyRows(shard, _db, "courses");
+    _copyRows(shard, _db, "lectures");
+    _copyRows(shard, _db, "ppt_pages");
+  } finally {
+    shard.close();
   }
 }
 
@@ -84,6 +148,18 @@ function _getLecture(subId) {
   return rows[0];
 }
 
+function _getPptPages(subId) {
+  // Only return done pages with non-empty text — keeps the PPT viewer
+  // free of pending placeholders and dropped pages.
+  return _queryAll(`
+    SELECT page_num, created_sec, text
+    FROM ppt_pages
+    WHERE sub_id = ? AND ocr_status = 'done'
+      AND text IS NOT NULL AND text != ''
+    ORDER BY created_sec ASC
+  `, [subId]);
+}
+
 function _searchSummaries(query) {
   if (!query?.trim()) return [];
   return _queryAll(`
@@ -94,24 +170,13 @@ function _searchSummaries(query) {
   `, [query, query]);
 }
 
-function _updateSummary(subId, newSummary) {
-  if (!_db) throw new Error("Database not loaded");
-  _db.run("UPDATE lectures SET summary = ?, summary_model = 'manual-edit' WHERE sub_id = ?",
-    [newSummary, subId]);
-}
-
-function _exportDB() {
-  if (!_db) throw new Error("Database not loaded");
-  return _db.export();
-}
-
 window.ICS.db = {
-  initDB: _initDB,
-  ensureSchema: _ensureSchema,
+  initDB: _initFromBytes,
+  initEmpty: _initEmpty,
+  attachShard: _attachShard,
   getCourses: _getCourses,
   getLectures: _getLectures,
   getLecture: _getLecture,
+  getPptPages: _getPptPages,
   searchSummaries: _searchSummaries,
-  updateSummary: _updateSummary,
-  exportDB: _exportDB,
 };
