@@ -95,6 +95,26 @@ function _highlightSnippet(text, query, radius) {
   return snip.replace(re, "<mark>$1</mark>");
 }
 
+function _formatTimestamp(seconds) {
+  var sec = Math.max(0, Math.floor(seconds || 0));
+  var h = Math.floor(sec / 3600);
+  var m = Math.floor((sec % 3600) / 60);
+  var s = sec % 60;
+  function pad(n) { return String(n).padStart(2, "0"); }
+  if (h > 0) return pad(h) + ":" + pad(m) + ":" + pad(s);
+  return pad(m) + ":" + pad(s);
+}
+
+/* Three-state detail view: summary → transcript → ppt → summary.
+   The button label always shows the *next* state so the user can read it
+   as an action ("切换到转录"). */
+const _DETAIL_VIEW_CYCLE = ["summary", "transcript", "ppt"];
+const _DETAIL_VIEW_LABEL = {
+  summary: "摘要",
+  transcript: "转录",
+  ppt: "PPT 识别",
+};
+
 /* ── Sharded loading helpers ── */
 async function _loadShard(owner, repo, entry, password, token) {
   // Hit cache first; on miss download → decrypt → gunzip and store the
@@ -160,8 +180,9 @@ document.addEventListener("alpine:init", () => {
     toast: null, toastType: "success",
     courses: [], lectures: [],
     currentCourse: null, currentLecture: null,
+    currentPptPages: [],
+    detailView: "summary",
     searchQuery: "", searchResults: [],
-    showTranscript: false,
     commitSha: null,
     setup: { token: "", stuid: "", uispsw: "", dashscope: "", smtp: "" },
     setupError: "", setupTesting: false,
@@ -228,7 +249,13 @@ document.addEventListener("alpine:init", () => {
         this.currentCourse = this.courses.find(x => x.course_id === params.courseId) || { course_id: params.courseId, title: "...", teacher: "" };
         this.lectures = ICS.db.getLectures(params.courseId);
       }
-      else if (view === "detail" && params.subId) { this.currentLecture = ICS.db.getLecture(params.subId); this.showTranscript = false; }
+      else if (view === "detail" && params.subId) {
+        this.currentLecture = ICS.db.getLecture(params.subId);
+        this.currentPptPages = this.currentLecture
+          ? ICS.db.getPptPages(this.currentLecture.sub_id)
+          : [];
+        this.detailView = "summary";
+      }
       this.view = view;
       if (view !== "lectures") this.exportDialogOpen = false;
     },
@@ -241,15 +268,20 @@ document.addEventListener("alpine:init", () => {
     openCourse(id) { this.navigate("lectures", { courseId: id }); },
     openLecture(id) { this.navigate("detail", { subId: id }); },
 
-    // Editing (manual summary edits) was retired when the data branch moved
-    // to a sharded layout — the frontend can no longer push back a single
-    // monolithic encrypted DB, and the workflow is the source of truth.
-    // Stubs keep the existing buttons in the template from throwing until
-    // subproject D removes them entirely.
-    editText: "", editPreview: false, saving: false,
-    startEdit() { this._toast("摘要编辑已下线，请等待新版前端", "error"); },
-    cancelEdit() { this.goBack(); },
-    saveEdit() { this._toast("摘要编辑已下线", "error"); },
+    /* Three-state detail viewer.  The button shown to the user always
+       advertises the *next* state so the label reads as an action. */
+    cycleDetailView() {
+      var idx = _DETAIL_VIEW_CYCLE.indexOf(this.detailView);
+      if (idx === -1) idx = 0;
+      this.detailView = _DETAIL_VIEW_CYCLE[(idx + 1) % _DETAIL_VIEW_CYCLE.length];
+    },
+    nextDetailViewLabel() {
+      var idx = _DETAIL_VIEW_CYCLE.indexOf(this.detailView);
+      if (idx === -1) idx = 0;
+      var next = _DETAIL_VIEW_CYCLE[(idx + 1) % _DETAIL_VIEW_CYCLE.length];
+      return "切换到" + _DETAIL_VIEW_LABEL[next];
+    },
+    formatPptTimestamp(sec) { return _formatTimestamp(sec); },
 
     getExportableLectures() {
       return (this.lectures || []).filter((lec) => lec.summary && lec.summary.trim());

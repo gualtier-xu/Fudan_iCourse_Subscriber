@@ -57,14 +57,6 @@
 /* Search highlight */
 mark { background: #fef08a; padding: 0 2px; border-radius: 2px; }
 
-/* Textarea for editing */
-.edit-textarea {
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 14px;
-  line-height: 1.6;
-  tab-size: 2;
-}
-
 /* Loading spinner */
 .spinner { border: 3px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; width: 32px; height: 32px; animation: spin 0.7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
