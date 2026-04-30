@@ -19,24 +19,64 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# LLM (ModelScope OpenAI-compatible API)
-DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
-LLM_BASE_URL = "https://api-inference.modelscope.cn/v1/"
-LLM_MODELS = [
-    "ZhipuAI/GLM-5",
-    "deepseek-ai/DeepSeek-V3.2",
-    "MiniMax/MiniMax-M2.5",
-    "Qwen/Qwen3.5-397B-A17B",
-    "ZhipuAI/GLM-4.7"
+# 模型服务商配置（按列表顺序作为优先级，从前往后尝试）
+# 用户可以在这里随意添加/删除/重排服务商和模型。
+# 兼容性：只设置 DASHSCOPE_API_KEY 也能跑（modelscope 项的 api_key 直接读取它）。
+MODEL_PROVIDERS: list[dict] = [
+    {
+        "name": "gemini",
+        "api_key_env": "GEMINI_API_KEY",
+        "base_url_env": "GEMINI_BASE_URL",
+        "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "models": [
+            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
+        ],
+    },
+    {
+        "name": "modelscope",
+        "api_key_env": "DASHSCOPE_API_KEY",
+        "base_url_env": "DASHSCOPE_BASE_URL",
+        "default_base_url": "https://api-inference.modelscope.cn/v1/",
+        "models": [
+            "ZhipuAI/GLM-5",
+            "deepseek-ai/DeepSeek-V3.2",
+            "MiniMax/MiniMax-M2.5",
+            "Qwen/Qwen3.5-397B-A17B",
+            "ZhipuAI/GLM-4.7",
+        ],
+    },
 ]
 
-# Gemini fallback (for content policy bypass)
+
+def resolve_model_providers() -> list[dict]:
+    """Resolve MODEL_PROVIDERS into runtime configs (api_key, base_url, models).
+
+    Returns only providers whose api_key env var is set. Order preserved.
+    """
+    resolved = []
+    for p in MODEL_PROVIDERS:
+        api_key = os.environ.get(p["api_key_env"], "").strip()
+        if not api_key:
+            continue
+        base_url = (
+            os.environ.get(p.get("base_url_env", ""), "").strip()
+            or p.get("default_base_url", "")
+        )
+        if not base_url:
+            continue
+        resolved.append({
+            "name": p["name"],
+            "api_key": api_key,
+            "base_url": base_url,
+            "models": list(p["models"]),
+        })
+    return resolved
+
+
+# Legacy compatibility shims (kept so other modules importing these don't break)
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-3-flash-preview"
-]
 
 # QQ SMTP
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")

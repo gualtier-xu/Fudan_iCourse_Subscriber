@@ -80,27 +80,28 @@ SYSTEM_PROMPT = r"""你是一个专业的课程助教。你的任务是根据用
 请牢记：**只要内容在逻辑上是连贯递进的，就必须写成段落；列表仅用于真正意义上的并列枚举（如对比多个独立选项、罗列参考文献等）。**"""
 
 class Summarizer:
-    """Course lecture summarizer using ModelScope OpenAI-compatible API."""
+    """Course lecture summarizer with multi-provider fallback.
+
+    Iterates config.MODEL_PROVIDERS in declared order. Within each provider,
+    tries each model in declared order. Returns the first successful result.
+    Setting only DASHSCOPE_API_KEY still works because the default
+    MODEL_PROVIDERS list ships a modelscope entry that reads it.
+    """
 
     def __init__(self):
-        if not config.DASHSCOPE_API_KEY:
-            raise ValueError("DASHSCOPE_API_KEY is not set")
-        self.client = OpenAI(
-            api_key=config.DASHSCOPE_API_KEY,
-            base_url=config.LLM_BASE_URL,
-        )
-        self.models = list(config.LLM_MODELS)
-
-        self._gemini_client = None
-        if config.GEMINI_API_KEY:
-            self._gemini_client = OpenAI(
-                api_key=config.GEMINI_API_KEY,
-                base_url=config.GEMINI_BASE_URL,
+        self.providers = config.resolve_model_providers()
+        if not self.providers:
+            raise ValueError(
+                "No model provider available. "
+                "Set at least one provider's API key (e.g. DASHSCOPE_API_KEY)."
             )
+        self._clients = {
+            p["name"]: OpenAI(api_key=p["api_key"], base_url=p["base_url"])
+            for p in self.providers
+        }
 
     def _call_llm(self, client: OpenAI, model: str,
                   title: str, content: str) -> str:
-        """Send a summarization request to a single model. Returns result text."""
         t0 = time.time()
         response = client.chat.completions.create(
             model=model,
@@ -123,42 +124,28 @@ class Summarizer:
         return result
 
     def summarize(self, title: str, content: str) -> tuple[str, str]:
-        """Summarize lecture content, trying Gemini first then ModelScope models.
+        """Summarize lecture, trying providers in MODEL_PROVIDERS order.
 
-        If GEMINI_API_KEY is set, Gemini is tried first. On failure (or when
-        the key is absent), all ModelScope models are tried in order.
-
-        Returns:
-            (summary, model_used) tuple.
+        Returns (summary, model_used) where model_used is "{provider}/{model}".
 
         Raises:
-            RuntimeError: If all models fail.
+            RuntimeError: if all providers/models fail.
         """
         if not content or not content.strip():
             return ("（内容为空）", "")
 
         errors = []
-
-        # Primary: Gemini (when API key is available)
-        if self._gemini_client:
-            for model in config.GEMINI_MODELS:
+        for provider in self.providers:
+            client = self._clients[provider["name"]]
+            for model in provider["models"]:
+                model_id = f"{provider['name']}/{model}"
                 try:
-                    result = self._call_llm(
-                        self._gemini_client, model, title, content,
-                    )
-                    return (result, f"gemini/{model}")
+                    result = self._call_llm(client, model, title, content)
+                    return (result, model_id)
                 except Exception as e:
-                    print(f"[Summarizer] gemini/{model} failed: {type(e).__name__}: {e}")
-                    errors.append(f"gemini/{model}: {e}")
-
-        # Fallback: ModelScope models
-        for model in self.models:
-            try:
-                result = self._call_llm(self.client, model, title, content)
-                return (result, model)
-            except Exception as e:
-                print(f"[Summarizer] {model} failed: {type(e).__name__}: {e}")
-                errors.append(f"{model}: {e}")
+                    print(f"[Summarizer] {model_id} failed: "
+                          f"{type(e).__name__}: {e}")
+                    errors.append(f"{model_id}: {e}")
 
         raise RuntimeError(
             "All LLM models failed:\n" + "\n".join(errors)
