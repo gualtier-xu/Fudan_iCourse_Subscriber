@@ -334,11 +334,21 @@ class Database:
         ).fetchone()[0]
 
     def update_summary_v2(self, sub_id: str, summary: str, model: str):
-        """Save summary, model, AND mark format version = 1 (PPT-aware)."""
+        """Save summary, model, AND mark format version = 1 (PPT-aware).
+
+        Preserves any previous summary into ``old_summary`` IF that column
+        hasn't been populated yet — so the FIRST overwrite (typically v0 → v2
+        via resummarize_old_lectures) captures the old text, but subsequent
+        re-runs don't clobber it.  COALESCE keeps NULLs as NULL on truly
+        first-time writes (new lecture).
+        """
         with self.conn:
             self.conn.execute(
                 """UPDATE lectures
-                   SET summary = ?, summary_model = ?, summary_format_version = 1
+                   SET old_summary = COALESCE(old_summary, summary),
+                       summary = ?,
+                       summary_model = ?,
+                       summary_format_version = 1
                    WHERE sub_id = ?""",
                 (summary, model, sub_id),
             )
