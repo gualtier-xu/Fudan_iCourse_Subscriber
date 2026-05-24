@@ -150,6 +150,10 @@ class PPTPipeline:
         self._db = db
         self._scheduler = scheduler
         self._reporter = reporter
+        # OCR futures submitted by prefetch_and_ocr (runs during LLM wait).
+        # Keyed by sub_id; submit() drains them before starting ASR if the
+        # pre-submitted OCR hasn't completed yet.
+        self._prefetched_ocr: dict[str, list[Future]] = {}
 
     # ── Public entry points ─────────────────────────────────────────────
 
@@ -182,11 +186,17 @@ class PPTPipeline:
         # run that aren't in the current prefetch.  Re-download those in
         # the main thread (rare path, kept simple).
         pending = self._db.get_pending_ppt_pages(sub_id)
-        # If pages already have dhash (prefetch_and_ocr submitted them in
-        # the previous lecture's LLM phase), skip re-processing here.
-        already_ocr_in_flight = any(p.get("dhash") for p in pending)
-        if already_ocr_in_flight:
-            pending = []
+        # If prefetch_and_ocr submitted OCR in the previous lecture's LLM
+        # phase, drain those futures before proceeding (OCR may still be
+        # running if the LLM returned early).
+        pre_futs = self._prefetched_ocr.pop(sub_id, None)
+        if pre_futs:
+            for fut in as_completed(pre_futs):
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+            pending = []  # pages were already processed
         presubmit_failed = 0
         for p in pending:
             page_num = p["page_num"]
@@ -300,12 +310,17 @@ class PPTPipeline:
             self._db.update_ppt_page(sub_id, pn, None, "dedup_dropped")
             images.pop(pn, None)
 
-        # Submit OCR
+        # Submit OCR — store futures so submit() can drain them if they
+        # haven't completed by the time the next lecture starts.
         ocr_pages = {pn: img for pn, img in images.items() if pn not in dropped}
         if self._reporter and ocr_pages:
             self._reporter.ocr_progress_start(sub_id, len(ocr_pages))
-        for pn, img in ocr_pages.items():
+        futures = [
             self._scheduler.submit_ocr(self._ocr_worker, sub_id, pn, img)
+            for pn, img in ocr_pages.items()
+        ]
+        if futures:
+            self._prefetched_ocr[sub_id] = futures
 
     def run_blocking(self, client: "ICourseClient", course_id: str,
                      sub_id: str) -> PPTStats:
