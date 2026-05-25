@@ -198,7 +198,12 @@ class WebVPNSession:
         )
         vpn_url = get_vpn_url(casapi_url)
 
-        # Follow redirect chain to reach IDP login page and extract lck
+        # Follow redirect chain to reach IDP login page and extract lck.
+        # The CAS gateway occasionally returns 200 + an HTML interstitial
+        # instead of a 302 chain — a short sleep gives it time to settle.
+        import time as _time
+        _time.sleep(1)
+
         resp = self.session.get(vpn_url, allow_redirects=False, timeout=60)
         lck = None
         for _ in range(15):
@@ -216,8 +221,9 @@ class WebVPNSession:
             )
 
         if not lck:
-            # Check final response URL and body
-            for source in [resp.url, resp.text[:5000]]:
+            # Check final response URL, body, AND any redirect history
+            for source in [resp.url, resp.text[:5000],
+                           str(getattr(resp, 'history', []))]:
                 m = re.search(r'lck=([^&#"]+)', source)
                 if m:
                     lck = m.group(1)
