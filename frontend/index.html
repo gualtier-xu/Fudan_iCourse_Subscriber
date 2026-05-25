@@ -608,7 +608,7 @@
            class="text-sm text-red-600 bg-red-50 rounded-lg p-3 mt-3"></p>
 
         <!-- Action buttons -->
-        <div class="mt-4 flex flex-col sm:flex-row items-center gap-2">
+        <div class="mt-4 flex items-center justify-between gap-2">
           <button @click="saveSubscriptions()" :disabled="subsSaving"
                   class="px-5 py-2.5 bg-blue-500 text-white rounded-lg text-sm font-medium hover:bg-blue-600 disabled:opacity-50 flex items-center gap-2">
             <div x-show="subsSaving" class="spinner !w-4 !h-4 !border-2 !border-white/30 !border-t-white"></div>
@@ -619,12 +619,9 @@
             <div x-show="singleRunTriggering" class="spinner !w-4 !h-4 !border-2 !border-white/30 !border-t-white"></div>
             <span x-text="singleRunTriggering ? '触发中…' : '▶ 单次运行'"></span>
           </button>
-          <span class="text-xs text-gray-400 ml-2">
-            单次运行会触发 workflow 处理选中课程，结果发送到 RECEIVER_EMAIL。
-          </span>
         </div>
-
-        <p class="text-xs text-gray-400 mt-2">
+        <p class="text-xs text-gray-400 mt-1">
+          单次运行会触发 workflow 处理选中课程，结果发送到 RECEIVER_EMAIL。
           保存需要 GitHub PAT 具备 <strong>Secrets: Read and write</strong> 权限。
         </p>
       </div>
