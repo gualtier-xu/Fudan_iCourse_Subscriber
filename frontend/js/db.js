@@ -174,7 +174,6 @@ function _searchSummaries(query, courseIds, page, pageSize, domains) {
   // Domain flags — default all enabled
   const d = domains || {};
   const matchSummary = d.summary !== false;
-  const matchSubtitle = d.sub_title !== false;
   const matchTranscript = d.transcript !== false;
   const matchOcr = d.ocr !== false;
 
@@ -183,7 +182,6 @@ function _searchSummaries(query, courseIds, page, pageSize, domains) {
   var textParams = [];
   function addText(cond) { textParts.push(cond); textParams.push(q); }
   if (matchSummary)    addText("l.summary    LIKE '%' || ? || '%'");
-  if (matchSubtitle)   addText("l.sub_title  LIKE '%' || ? || '%'");
   if (matchTranscript) addText("l.transcript LIKE '%' || ? || '%'");
   if (matchOcr)        addText("EXISTS(SELECT 1 FROM ppt_pages pp3 WHERE pp3.sub_id = l.sub_id AND pp3.ocr_status = 'done' AND pp3.text LIKE '%' || ? || '%')");
 
@@ -194,7 +192,6 @@ function _searchSummaries(query, courseIds, page, pageSize, domains) {
   var caseParams = [];
   function addCase(when, then) { caseParts.push("WHEN " + when + " THEN '" + then + "'"); caseParams.push(q); }
   if (matchSummary)    addCase("l.summary    LIKE '%' || ? || '%'", "summary");
-  if (matchSubtitle)   addCase("l.sub_title  LIKE '%' || ? || '%'", "sub_title");
   if (matchTranscript) addCase("l.transcript LIKE '%' || ? || '%'", "transcript");
   if (matchOcr)        addCase("EXISTS(SELECT 1 FROM ppt_pages pp2 WHERE pp2.sub_id = l.sub_id AND pp2.ocr_status = 'done' AND pp2.text LIKE '%' || ? || '%')", "ocr");
 

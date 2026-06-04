@@ -255,7 +255,7 @@ document.addEventListener("alpine:init", () => {
     searchCourseFilterQuery: "", searchSelectedCourseIds: [],
     searchCourseOpen: false,
     searchPage: 1, searchHasMore: false,
-    searchDomains: { summary: true, sub_title: true, transcript: true, ocr: true },
+    searchDomains: { summary: true, transcript: true, ocr: true },
     commitSha: null,
     setup: { token: "", stuid: "", uispsw: "" },
     setupError: "", setupTesting: false,
