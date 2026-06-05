@@ -779,7 +779,7 @@
 <div x-show="deleteDialogOpen" x-transition.opacity
      class="fixed inset-0 z-50 bg-black/40 flex items-end md:items-center justify-center p-3"
      @click.self="closeDeleteDialog()">
-  <div class="w-full max-w-sm bg-white rounded-xl shadow-xl max-h-[85vh] flex flex-col">
+  <div class="w-full max-w-2xl bg-white rounded-xl shadow-xl max-h-[85vh] flex flex-col">
     <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200">
       <h3 class="font-semibold text-gray-800">删除课次</h3>
       <button @click="closeDeleteDialog()" class="text-gray-400 hover:text-gray-600 text-sm">关闭</button>
@@ -803,10 +803,17 @@
                  @change="toggleDeleteLecture(lec.sub_id, $event.target.checked)">
           <div class="min-w-0">
             <p class="text-sm font-medium text-gray-800 truncate" x-text="lec.sub_title || 'Untitled'"></p>
-            <p class="text-xs text-gray-400 mt-0.5" x-text="lec.date"></p>
+            <p class="text-xs text-gray-500 mt-1 line-clamp-2" x-text="snippet(lec.summary, 100)"></p>
           </div>
         </label>
       </template>
+      <p x-show="getDeletableLectures().length === 0" class="text-sm text-gray-500 text-center py-8">
+        当前课程无可删除的课次。
+      </p>
+    </div>
+
+    <div class="px-4 py-2 bg-red-50 border-t border-red-100 text-xs text-red-800 leading-relaxed">
+      <p>此操作将删除所选课次的转录、PPT OCR 和摘要数据，并通过 workflow 推送到远端。不可撤销。</p>
     </div>
 
     <div class="px-4 py-3 border-t border-gray-100 flex justify-end gap-2">
