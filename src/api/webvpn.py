@@ -184,11 +184,10 @@ class WebVPNSession:
         print("[*] Starting iCourse CAS authentication through WebVPN...")
         idp_vpn_base = get_vpn_url(config.IDP_BASE)
 
-        # Step 1: Initiate CAS login via casapi
-        # This is equivalent to clicking "校内用户登录" in the browser.
-        # casapi will 302-redirect to IDP with the correct service URL:
-        #   service=https://icourse.fudan.edu.cn/casapi/index.php
-        #          ?forward=https%3A%2F%2Ficourse.fudan.edu.cn%2F&r=auth/login
+        # Step 1: Initiate CAS login via casapi — let requests follow
+        # redirects like a browser.  If the WebVPN session is cold, the
+        # /login bounce transparently re-establishes it; requests follows
+        # the chain to the IDP login page where lck is always present.
         print("[1/7] Initiating CAS login via casapi...")
         casapi_url = (
             f"{config.ICOURSE_BASE}/casapi/index.php"
@@ -198,52 +197,23 @@ class WebVPNSession:
         )
         vpn_url = get_vpn_url(casapi_url)
 
-        # Follow redirect chain to reach IDP login page and extract lck.
-        # The WebVPN proxy sometimes fails to recognise a freshly-created
-        # session (~40% cold).  When that happens we let login_with_retry()
-        # in main.py re-login from scratch — a cold session stays cold no
-        # matter how many times you poke it.
-        import time as _time
+        resp = self.session.get(vpn_url, allow_redirects=True, timeout=60)
         lck = None
-        last_locations: list[str] = []
-        for cas_attempt in range(3):
-            if cas_attempt > 0:
-                _time.sleep(2)
-                print(f"    CAS lck extract retry {cas_attempt}/2...")
-            resp = self.session.get(vpn_url, allow_redirects=False, timeout=60)
-            last_locations = []
-            for _ in range(15):
-                location = resp.headers.get("Location", "")
-                if resp.status_code not in (301, 302, 303, 307) or not location:
-                    break
-                last_locations.append(location)
-                lck_match = re.search(r'lck=([^&#"]+)', location)
-                if lck_match:
-                    lck = lck_match.group(1)
-                    break
-                if not location.startswith("http"):
-                    location = urljoin(resp.url, location)
-                resp = self.session.get(
-                    location, allow_redirects=False, timeout=60
-                )
-            if lck:
-                break
-            # Check final response for lck embedded in HTML
-            for source in [resp.url, resp.text[:5000],
-                           str(getattr(resp, 'history', []))]:
-                m = re.search(r'lck=([^&#"]+)', source)
-                if m:
-                    lck = m.group(1)
-                    break
-            if lck:
+        for source in [resp.url] + [
+            h.headers.get("Location", "") for h in (resp.history or [])
+        ]:
+            m = re.search(r'lck=([^&#"]+)', source)
+            if m:
+                lck = m.group(1)
                 break
         if not lck:
-            # Log the redirect trail so future failures are diagnosable
-            # without re-running with extra prints.
-            trail = " -> ".join(last_locations[-3:]) if last_locations else "<no redirects>"
+            m = re.search(r'lck=([^&#"]+)', resp.text[:5000])
+            if m:
+                lck = m.group(1)
+        if not lck:
             raise RuntimeError(
                 f"Failed to extract lck from CAS redirect chain "
-                f"(status={resp.status_code}, last hops: {trail})"
+                f"(final URL: {resp.url[:120]})"
             )
 
         entity_id = config.ICOURSE_BASE
@@ -599,7 +569,7 @@ class WebVPNSession:
         for attempt in range(3):
             try:
                 resp = self.session.get(
-                    ticket_url, allow_redirects=True, timeout=90
+                    ticket_url, allow_redirects=True, timeout=20
                 )
                 if resp.status_code == 200:
                     print("    Session established.")
