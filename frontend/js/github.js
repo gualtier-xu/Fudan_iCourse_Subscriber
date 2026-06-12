@@ -43,58 +43,6 @@ async function _getLatestCommitSha(owner, repo, branch, token) {
   return data.object.sha;
 }
 
-async function _fetchEncryptedDB(owner, repo, branch, token) {
-  // 1) Get commit SHA + tree
-  const commitSha = await _getLatestCommitSha(owner, repo, branch, token);
-
-  // 2) Walk commit → tree → data/ subtree to find the DB file
-  const commitRes = await fetch(
-    `${_GH_API}/repos/${owner}/${repo}/git/commits/${commitSha}`,
-    { headers: _ghHeaders(token) }
-  );
-  if (!commitRes.ok) throw new Error(`Failed to get commit: ${commitRes.status}`);
-  const treeSha = (await commitRes.json()).tree.sha;
-
-  const treeRes = await fetch(
-    `${_GH_API}/repos/${owner}/${repo}/git/trees/${treeSha}`,
-    { headers: _ghHeaders(token) }
-  );
-  if (!treeRes.ok) throw new Error(`Failed to get tree: ${treeRes.status}`);
-  const treeData = await treeRes.json();
-
-  const dataEntry = treeData.tree.find((e) => e.path === "data" && e.type === "tree");
-  if (!dataEntry) throw new Error("'data/' directory not found on data branch.");
-
-  const subTreeRes = await fetch(
-    `${_GH_API}/repos/${owner}/${repo}/git/trees/${dataEntry.sha}`,
-    { headers: _ghHeaders(token) }
-  );
-  if (!subTreeRes.ok) throw new Error(`Failed to get data/ tree: ${subTreeRes.status}`);
-  const subTree = await subTreeRes.json();
-
-  // Try compressed format first, then legacy
-  var fileEntry = subTree.tree.find((e) => e.path === "icourse.db.gz.enc");
-  var compressed = !!fileEntry;
-  if (!fileEntry) {
-    fileEntry = subTree.tree.find((e) => e.path === "icourse.db.enc");
-  }
-  if (!fileEntry) throw new Error("Database file not found on data branch.");
-
-  // 3) Download blob as raw binary
-  const blobRes = await fetch(
-    `${_GH_API}/repos/${owner}/${repo}/git/blobs/${fileEntry.sha}`,
-    {
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: "application/vnd.github.raw",
-      },
-    }
-  );
-  if (!blobRes.ok) throw new Error(`Failed to download blob: ${blobRes.status}`);
-  const buffer = await blobRes.arrayBuffer();
-  return { data: new Uint8Array(buffer), commitSha, compressed };
-}
-
 async function _fetchBlobBytes(owner, repo, blobSha, token) {
   const res = await fetch(
     `${_GH_API}/repos/${owner}/${repo}/git/blobs/${blobSha}`,
@@ -298,33 +246,6 @@ async function _triggerSingleRunWorkflow(owner, repo, ref, token, courseIds, use
   throw new Error(`GitHub API error ${res.status}: ${body}`);
 }
 
-async function _triggerCheckWorkflow(owner, repo, ref, token) {
-  // Fires the iCourse Check workflow (check.yml) via workflow_dispatch.
-  // The workflow uses ``secrets.COURSE_IDS`` directly — no inputs needed.
-  // PAT needs ``Actions: Read and write`` for the dispatch endpoint.
-  const url = `${_GH_API}/repos/${owner}/${repo}/actions/workflows/check.yml/dispatches`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { ..._ghHeaders(token), "Content-Type": "application/json" },
-    body: JSON.stringify({ ref: ref || "main" }),
-  });
-  if (res.status === 204) return;
-  const body = await res.text();
-  if (res.status === 403 || res.status === 404) {
-    throw new Error(
-      "无法触发 check workflow。请确认 PAT 已开启 Actions: Read and write " +
-      `权限。服务端返回：${res.status} ${body}`
-    );
-  }
-  if (res.status === 422) {
-    throw new Error(
-      "触发失败 (422)：通常是 check.yml 不存在于指定分支 " +
-      `'${ref || "main"}'。服务端返回：${body}`
-    );
-  }
-  throw new Error(`GitHub API error ${res.status}: ${body}`);
-}
-
 async function _triggerDeleteWorkflow(owner, repo, ref, token, courseIds, subIds) {
   const url = `${_GH_API}/repos/${owner}/${repo}/actions/workflows/delete_course.yml/dispatches`;
   const ids = (Array.isArray(courseIds) ? courseIds : [])
@@ -399,12 +320,10 @@ async function _triggerExportWorkflow(
 window.ICS.github = {
   detectRepo: _detectRepo,
   getLatestCommitSha: _getLatestCommitSha,
-  fetchEncryptedDB: _fetchEncryptedDB,
   fetchBlobBytes: _fetchBlobBytes,
   fetchShardManifest: _fetchShardManifest,
   triggerExportWorkflow: _triggerExportWorkflow,
   triggerDeleteWorkflow: _triggerDeleteWorkflow,
-  triggerCheckWorkflow: _triggerCheckWorkflow,
   triggerSingleRunWorkflow: _triggerSingleRunWorkflow,
   getRepoPublicKey: _getRepoPublicKey,
   putRepoSecret: _putRepoSecret,

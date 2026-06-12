@@ -299,7 +299,7 @@ function _searchSummaries(query, courseIds, page, pageSize, domains) {
            ${caseSql} AS hit_field
     FROM lectures l JOIN courses c ON l.course_id = c.course_id
     WHERE ` + whereClauses.join(" AND ") + `
-    ORDER BY l.processed_at DESC LIMIT ? OFFSET ?
+    ORDER BY l.processed_at DESC, l.sub_id DESC LIMIT ? OFFSET ?
   `, params.concat([pageSize + 1, offset]));
 
   var hasMore = rows.length > pageSize;
@@ -307,38 +307,11 @@ function _searchSummaries(query, courseIds, page, pageSize, domains) {
   return { results: rows, page: page, hasMore: hasMore };
 }
 
-function _getAllCourses(term) {
-  // Catalog of every course offered by the school for ``term`` (or all
-  // terms if undefined).  Populated by main.py's CRAWL_TERM-driven crawl;
-  // empty until that env var has been set at least once on the CI side.
-  if (term) {
-    return _queryAll(
-      "SELECT * FROM all_courses WHERE term = ? ORDER BY title",
-      [term],
-    );
-  }
-  return _queryAll(
-    "SELECT * FROM all_courses ORDER BY term DESC, title"
-  );
-}
-
-function _getAllCoursesTerms() {
-  return _queryAll(
-    "SELECT DISTINCT term FROM all_courses ORDER BY term DESC"
-  ).map((r) => r.term).filter(function (t) {
-    for (var gi = 0; gi < _INVALID_TERMS_GLOB.length; gi++) {
-      if (t.indexOf(_INVALID_TERMS_GLOB[gi].replace(/\*/g, "")) !== -1) return false;
-    }
-    for (var ei = 0; ei < _INVALID_TERMS_EXACT.length; ei++) {
-      if (t === _INVALID_TERMS_EXACT[ei]) return false;
-    }
-    return true;
-  });
-}
-
-function _buildCatalogWhere(filters) {
-  // Shared WHERE/params builder for paged search + count + dept distinct.
-  // Filters: { terms: string[], depts: string[], title: string, teacher: string }
+function _invalidTermExclusion() {
+  // Single source of truth for excluding pre-recording-system terms. Used by
+  // both the catalog WHERE builder and the term dropdown so the two never
+  // diverge (they previously used different mechanisms — SQL GLOB here vs a
+  // JS substring test in the dropdown — which could disagree).
   var clauses = [];
   var params = [];
   for (var gi = 0; gi < _INVALID_TERMS_GLOB.length; gi++) {
@@ -349,6 +322,24 @@ function _buildCatalogWhere(filters) {
     clauses.push("term != ?");
     params.push(_INVALID_TERMS_EXACT[ei]);
   }
+  return { clauses: clauses, params: params };
+}
+
+function _getAllCoursesTerms() {
+  var ex = _invalidTermExclusion();
+  var where = ex.clauses.length ? "WHERE " + ex.clauses.join(" AND ") : "";
+  return _queryAll(
+    "SELECT DISTINCT term FROM all_courses " + where + " ORDER BY term DESC",
+    ex.params,
+  ).map(function (r) { return r.term; });
+}
+
+function _buildCatalogWhere(filters) {
+  // Shared WHERE/params builder for paged search + count + dept distinct.
+  // Filters: { terms: string[], depts: string[], title: string, teacher: string }
+  var ex = _invalidTermExclusion();
+  var clauses = ex.clauses.slice();
+  var params = ex.params.slice();
   if (filters.terms && filters.terms.length) {
     clauses.push("term IN (" + filters.terms.map(function () { return "?"; }).join(",") + ")");
     for (var i = 0; i < filters.terms.length; i++) params.push(filters.terms[i]);
@@ -447,13 +438,6 @@ function _getAllCoursesDepts(termFilter, search) {
   return rows.map(function (r) { return r.dept; });
 }
 
-function _getSubscribedCourseIds() {
-  // The ``courses`` table holds courses we've actually run.  This is our
-  // best signal of "currently subscribed" without reading the
-  // COURSE_IDS secret (which GitHub never exposes back).
-  return _queryAll("SELECT course_id FROM courses").map((r) => r.course_id);
-}
-
 function _getMeta(key) {
   var rows = _queryAll("SELECT value FROM meta WHERE key = ?", [key]);
   return rows.length ? rows[0].value : null;
@@ -469,12 +453,10 @@ window.ICS.db = {
   getLecture: _getLecture,
   getPptPages: _getPptPages,
   searchSummaries: _searchSummaries,
-  getAllCourses: _getAllCourses,
   getAllCoursesTerms: _getAllCoursesTerms,
   searchAllCourses: _searchAllCourses,
   countAllCourses: _countAllCourses,
   getCoursesByIds: _getCoursesByIds,
   getAllCoursesDepts: _getAllCoursesDepts,
-  getSubscribedCourseIds: _getSubscribedCourseIds,
   getMeta: _getMeta,
 };

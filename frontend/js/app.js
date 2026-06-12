@@ -330,11 +330,8 @@ document.addEventListener("alpine:init", () => {
           );
         }
 
-        var sorted = this._sortCoursesByStar(ICS.db.getCourses());
-        this.courses = sorted;
+        this.courses = this._sortCoursesByStar(ICS.db.getCourses());
         this.view = "courses";
-        var self = this;
-        this.$nextTick(function () { self.courses = self._sortCoursesByStar(self.courses); });
       } catch (e) {
         this.error = e.message;
         this.view = "error";
@@ -555,12 +552,6 @@ document.addEventListener("alpine:init", () => {
           lines.push(lec.summary);
           lines.push("");
         }
-        if (lec.transcript) {
-          lines.push("### 转录文本");
-          lines.push("");
-          lines.push(lec.transcript);
-          lines.push("");
-        }
         lines.push("---");
         lines.push("");
       }
@@ -614,7 +605,6 @@ document.addEventListener("alpine:init", () => {
         this._toast("未登录或 PAT 缺失", "error");
         return;
       }
-      if (!confirm("确定要删除选中的 " + selected.length + " 节课吗？此操作不可撤销。")) return;
       this.deletingCourses = true;
       try {
         var currentCid = this.currentCourse ? String(this.currentCourse.course_id) : null;
