@@ -103,6 +103,8 @@ class Summarizer:
             # temperature=0.3,
             timeout=180,
         )
+        if not response.choices:
+            raise ValueError("API returned empty choices — likely content filter or quota exceeded")
         result = response.choices[0].message.content
         elapsed = time.time() - t0
         # Token usage helps explain run cost — every provider's billing is
