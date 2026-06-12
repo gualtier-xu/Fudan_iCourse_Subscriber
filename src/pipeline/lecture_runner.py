@@ -315,12 +315,16 @@ class LectureRunner:
             self._release_audio(sub_id)
             return None, None
         except IncompleteAudioError as e:
-            # tail mode doesn't enforce a 90% check, but if the transcriber
-            # ever raises this we save whatever we got so the next run can
-            # decide whether to retry.
-            self._reporter.info(f"    [WARN] Incomplete audio: {e}")
-            transcript = self._transcriber._last_transcript
-            segments = self._transcriber._last_segments
+            # Truncated download (ffmpeg may even exit 0 on a server-side
+            # cut).  Don't persist the partial transcript — it would
+            # short-circuit the retry — just record the error so the
+            # lecture is retried up to max_errors times.
+            self._reporter.info(
+                f"    [SKIP] Incomplete audio, will retry next run: {e}"
+            )
+            self._db.update_error(sub_id, "transcribe", str(e))
+            self._release_audio(sub_id)
+            return None, None
         except Exception as e:
             self._reporter.info(
                 f"    [FAIL] Transcription error: {type(e).__name__}: {e}"
