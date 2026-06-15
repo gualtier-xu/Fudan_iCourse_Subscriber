@@ -33,8 +33,10 @@ from src.api import icourse
 class PrefetchCache:
     """Per-lecture image-bytes pre-fetcher driven by the global image pool.
 
-    schedule(client, course_id, sub_id) — fire all image downloads, return
-                                          immediately.  Idempotent.
+    schedule(client, course_id, sub_id) — fetch the PPT list (synchronous,
+                                          a few paginated GETs), fire all
+                                          image downloads into the pool,
+                                          then return.  Idempotent.
     wait(sub_id) -> (items, images)   — block until every download for sub_id
                                           resolves.
     discard(sub_id)                    — drop the cached entry (release bytes).
@@ -131,6 +133,13 @@ class AudioHandle:
     stderr_chunks: list[bytes]
 
 
+class _PendingSpawn:
+    """Per-schedule placeholder stored in ``_active`` while the background
+    spawn is still working.  A unique instance per ``schedule()`` call lets
+    the spawn thread detect that its entry was ``release()``-d (or replaced)
+    in the meantime and abort instead of resurrecting a zombie entry."""
+
+
 class AudioDownloader:
     """Spawn-and-track concurrent ``ffmpeg`` audio extractions.
 
@@ -145,14 +154,13 @@ class AudioDownloader:
     returns immediately; if all slots are taken the background spawn waits.
     """
 
-    SLOT_WAIT_TIMEOUT = 0  # 0 = wait forever
-
     def __init__(self, audio_dir: str, max_concurrent: int = None,
                  reporter=None):
         self._dir = audio_dir
         self.max_concurrent = max_concurrent or config.VIDEO_DOWNLOAD_CONCURRENCY
         self._sem = threading.BoundedSemaphore(self.max_concurrent)
-        self._active: dict[str, AudioHandle | None] = {}  # None = pending spawn
+        # sub_id -> AudioHandle (ready) | _PendingSpawn (spawn in flight)
+        self._active: dict[str, "AudioHandle | _PendingSpawn"] = {}
         self._lock = threading.Lock()
         self._reporter = reporter
         os.makedirs(self._dir, exist_ok=True)
@@ -160,7 +168,10 @@ class AudioDownloader:
     @property
     def active_count(self) -> int:
         with self._lock:
-            return sum(1 for h in self._active.values() if h is not None)
+            return sum(
+                1 for h in self._active.values()
+                if isinstance(h, AudioHandle)
+            )
 
     def schedule(self, client, course_id: str, sub_id: str) -> None:
         """Reserve a slot for sub_id and spawn ffmpeg in the background.
@@ -170,26 +181,33 @@ class AudioDownloader:
         the same sub_id is a no-op.
         """
         sub_id = str(sub_id)
+        pending = _PendingSpawn()
         with self._lock:
             if sub_id in self._active:
                 return
-            self._active[sub_id] = None  # PENDING
+            self._active[sub_id] = pending
 
         threading.Thread(
             target=self._spawn_when_ready,
-            args=(client, course_id, sub_id),
+            args=(client, course_id, sub_id, pending),
             name=f"audio-spawn-{sub_id}",
             daemon=True,
         ).start()
 
-    def _spawn_when_ready(self, client, course_id: str, sub_id: str):
+    def _pop_if_mine(self, sub_id: str, pending: _PendingSpawn) -> None:
+        """Remove our pending entry — but only if it is still ours."""
+        with self._lock:
+            if self._active.get(sub_id) is pending:
+                self._active.pop(sub_id, None)
+
+    def _spawn_when_ready(self, client, course_id: str, sub_id: str,
+                          pending: _PendingSpawn):
         try:
             self._sem.acquire()
             try:
                 url = client.get_video_url(course_id, sub_id)
                 if not url:
-                    with self._lock:
-                        self._active.pop(sub_id, None)
+                    self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
                 vpn_url, headers = client.get_stream_params(url)
@@ -239,8 +257,29 @@ class AudioDownloader:
                     process=proc, stderr_chunks=stderr_chunks,
                 )
 
+                # Install the handle — unless release() already removed our
+                # pending entry (e.g. get() timed out and the caller gave
+                # up).  In that case nobody will ever release this handle,
+                # so kill the orphan ffmpeg here instead of letting it hold
+                # a download slot for the rest of the run.
                 with self._lock:
-                    self._active[sub_id] = handle
+                    installed = self._active.get(sub_id) is pending
+                    if installed:
+                        self._active[sub_id] = handle
+                if not installed:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    self._sem.release()
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                    return
 
                 if self._reporter:
                     self._reporter.audio_prefetch_start(sub_id)
@@ -253,8 +292,7 @@ class AudioDownloader:
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
             except Exception:
-                with self._lock:
-                    self._active.pop(sub_id, None)
+                self._pop_if_mine(sub_id, pending)
                 self._sem.release()
                 raise
         except Exception as e:
@@ -275,11 +313,11 @@ class AudioDownloader:
         deadline = time.time() + timeout
         while True:
             with self._lock:
-                entry = self._active.get(sub_id, "MISSING")
-            if entry == "MISSING":
-                return None
-            if entry is not None:
-                return entry
+                entry = self._active.get(sub_id)
+                if entry is None:
+                    return None
+                if isinstance(entry, AudioHandle):
+                    return entry
             if time.time() > deadline:
                 raise TimeoutError(
                     f"audio download for {sub_id} did not start within "
@@ -292,12 +330,14 @@ class AudioDownloader:
         """Kill ffmpeg (if still alive) and delete the audio file.
 
         Called from LectureRunner Phase H once the lecture has been
-        transcribed and summarized.
+        transcribed and summarized.  If the spawn is still pending, the
+        entry is removed and the spawn thread aborts itself when it
+        notices its token is gone.
         """
         sub_id = str(sub_id)
         with self._lock:
             handle = self._active.pop(sub_id, None)
-        if handle is None:
+        if not isinstance(handle, AudioHandle):
             return
         proc = handle.process
         if proc.poll() is None:
@@ -370,10 +410,16 @@ class Scheduler:
             reporter=reporter,
         )
 
-    def prefetch_lecture(self, client, course_id: str, sub_id: str) -> None:
-        """Schedule image + audio prefetch for a future lecture."""
+    def prefetch_lecture(self, client, course_id: str, sub_id: str,
+                         *, audio: bool = True) -> None:
+        """Schedule image (always) + audio (optional) prefetch for a future
+        lecture.  Pass ``audio=False`` when the caller already knows
+        transcription won't read the stream (cached or official
+        transcript) — the ffmpeg download is a full pull of the lecture
+        and would otherwise hold one of the two slots for nothing."""
         self.image_cache.schedule(client, course_id, sub_id)
-        self.audio_downloader.schedule(client, course_id, sub_id)
+        if audio:
+            self.audio_downloader.schedule(client, course_id, sub_id)
 
     def submit_ocr(self, fn: Callable, *args, **kwargs) -> Future:
         """Submit an OCR job.  Live concurrency is capped at

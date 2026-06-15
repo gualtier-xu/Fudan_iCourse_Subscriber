@@ -32,11 +32,36 @@ def _ensure_schema(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE ppt_pages ADD COLUMN {col} {typedef}")
 
 
+def _migrate_attached(conn: sqlite3.Connection, schema: str):
+    """Bring an ATTACHed database up to the current column set.
+
+    The merge below SELECTs migration columns (e.g. ``dhash``) from the
+    local side; a local DB written by an older code version would make
+    those statements crash with "no such column".  ALTER TABLE works on
+    attached schemas, so pad the missing columns with NULLs first.
+    """
+    for table, cols in (
+        ("lectures", LECTURES_MIGRATION_COLUMNS),
+        ("ppt_pages", PPT_PAGES_MIGRATION_COLUMNS),
+    ):
+        existing = {
+            r[1] for r in conn.execute(f"PRAGMA {schema}.table_info({table})")
+        }
+        if not existing:
+            continue  # table absent entirely; nothing to pad
+        for col, typedef in cols:
+            if col not in existing:
+                conn.execute(
+                    f"ALTER TABLE {schema}.{table} ADD COLUMN {col} {typedef}"
+                )
+
+
 def merge(local_path: str, remote_path: str):
     """Merge local changes into remote DB.  Only adds/progresses, never deletes."""
     conn = sqlite3.connect(remote_path)
     _ensure_schema(conn)
     conn.execute("ATTACH DATABASE ? AS local", (local_path,))
+    _migrate_attached(conn, "local")
 
     try:
         with conn:
@@ -88,8 +113,10 @@ def merge(local_path: str, remote_path: str):
             """)
 
             # 4) PPT pages: insert local-only rows.  Existing rows are left
-            # untouched — if it's already in the remote DB the previous run
-            # already handled it, and we have no business second-guessing.
+            # untouched — as-is by design: a pre-existing bug left many rows
+            # stuck at 'pending' that are really invalid/dedup results, and
+            # "progressing" them here would resurrect that garbage.  If a
+            # row is already in the remote DB, whatever wrote it owns it.
             conn.execute("""
                 INSERT OR IGNORE INTO main.ppt_pages
                     (sub_id, page_num, created_sec, pptimgurl, text, ocr_status, ocr_at, dhash)

@@ -8,17 +8,59 @@ Each section documents which function consumes it and the match strategy.
 
 from __future__ import annotations
 
-# ── DHASH dedup config ──────────────────────────────────────────────────────
-# Used by dedup_dhash() before OCR — drops near-duplicate frames by perceptual
-# hash so OCR only runs on visually distinct pages.
-DHASH_WINDOW: int = 10       # sliding window size (images to compare against)
-DHASH_THRESHOLD: int = 2     # max Hamming-distance bits to consider "duplicate"
+# ── Garbage catalog (Step 1) ────────────────────────────────────────────────
+# Pre-computed dhash values of known garbage pages (recording-guide splashes,
+# classroom desktops, login screens, etc.).  Sampled uniformly from 16 courses
+# across 17 visual clusters.  Used by match_garbage() before OCR.
+GARBAGE_CATALOG: list[str] = [
+    "9a69696969696917",  # browser_incognito
+    "2624444641034343",  # desktop_H4301
+    "360c3632320f7303",  # desktop_H4301_delete
+    "9e9a18381a262303",  # desktop_H6401
+    "9f1a983818a72703",  # desktop_HGX106
+    "1e9a98981a262223",  # desktop_HGX210
+    "9f9a98181a261333",  # desktop_HGX308
+    "3e1a38383a232f2c",  # desktop_HGX505
+    "9e1a98383a272383",  # desktop_HGX_other
+    "9e5a989898969323",  # desktop_classroom_other
+    "9e9a981818272303",  # desktop_download_folder
+    "34352f2337536313",  # desktop_evrec
+    "3535392337536313",  # desktop_evrecording
+    "e5a5a4e4e4845883",  # desktop_saveas
+    "9b1e322022b30e23",  # desktop_splash_desktop_HGX308
+    "b6b4b436363232b2",  # desktop_usb
+    "f4f4d4f4f4f4f4d0",  # desktop_usb_drive
+    "59c23c2434d8d827",  # login_fudan_idp
+    "21c218944448b40f",  # login_fudan_qr
+    "68968e689e9670dc",  # misc_miracast
+    "f0f0f0f0f0f0f8f0",  # misc_no_signal_v2
+    "008aca8a499aaa21",  # misc_wifi_rayhunt
+    "3135392337536313",  # splash_ce_eval
+    "3435392337536313",  # splash_ce_fudan
+    "35352d2337536333",  # splash_elearning
+    "31350d2337536313",  # splash_elearning_network
+    "3b9b161626079823",  # splash_fudan_logo_course
+    "3b9b161626078803",  # splash_fudan_logo_eval
+    "3035292337536333",  # splash_icourse_fudan
+    "3135292337536333",  # splash_icourse_spec
+    "604cb2b2b2b2b20f",  # splash_other
+    "35353d2337536313",  # splash_video_guide
+    "0000826969600206",  # system_oss_boot
+    "0000001030090000",  # system_windows_restart
+]
+GARBAGE_THRESHOLD: int = 8
+
+# ── DHASH dedup config (Step 2) ─────────────────────────────────────────────
+# Used by dedup_dhash() after garbage-catalog matching — drops near-duplicate
+# frames among survivors.  Auto-raises threshold until survivors ≤ MAX_SURVIVORS.
+DHASH_THRESHOLD: int = 3     # initial max Hamming-distance bits to consider "duplicate"
+DHASH_MAX_SURVIVORS: int = 150  # auto-raise threshold until survivors ≤ this
 
 # ── Text subset dedup config ────────────────────────────────────────────────
 # Used by dedup_text_subset() after OCR — removes pages whose text is a
 # near-subset of a nearby page (common with PPT animation reveals).
 SUBSET_CONFIG: dict = {
-    "window": 8,                  # look-back window (kept pages)
+    "window": 20,                  # look-back window (kept pages)
     "ngram_n": 3,                 # n-gram size for containment scoring
     "containment_threshold": 0.85,  # min n-gram containment to flag subset
     "min_length_ratio": 1.10,     # long/short length ratio must exceed this

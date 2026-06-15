@@ -277,7 +277,7 @@
             </div>
             <div class="flex flex-col items-end flex-shrink-0">
               <span class="text-xs font-medium bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full"
-                    x-text="c.summary_count + '/' + c.total_count + ' summaries'"></span>
+                    x-text="c.summary_count + ' summaries'"></span>
               <span class="text-xs text-gray-400 mt-1" x-text="relTime(c.last_updated)"></span>
             </div>
           </div>
@@ -305,12 +305,15 @@
                   :class="{
                     'badge-ready': lec.state === 'ready',
                     'badge-processing': lec.state === 'processing',
-                    'badge-waiting': lec.state === 'waiting',
+                    'badge-waiting': lec.state === 'waiting' || lec.state === 'novideo',
+                    'badge-skipped': lec.state === 'skipped',
                     'badge-failed': lec.state === 'failed'
                   }"
                   x-text="lec.state === 'ready' ? 'Ready' :
                           lec.state === 'processing' ? 'Summarizing…' :
                           lec.state === 'waiting' ? 'Waiting' :
+                          lec.state === 'novideo' ? 'No Video' :
+                          lec.state === 'skipped' ? 'No Content' :
                           'Failed: ' + (lec.error_stage || 'unknown')"></span>
           </div>
           <!-- Preview snippet for ready lectures -->
@@ -385,7 +388,7 @@
         <!-- Prev / next lecture nav (foot of detail view).  Wraps within the
              current course's lecture list, in the same order the lectures
              page renders.  Hidden on the only/last/first lecture as
-             appropriate; respects sub_id ordering. -->
+             appropriate; respects chronological (sub_title) ordering. -->
         <nav class="mt-8 pt-4 border-t border-gray-100 flex items-stretch gap-2 text-sm">
           <button @click="gotoPrevLecture()"
                   :disabled="!prevLecture()"
@@ -705,6 +708,13 @@
             <div x-show="subsSaving" class="spinner !w-4 !h-4 !border-2 !border-white/30 !border-t-white"></div>
             <span x-text="subsSaving ? '加密上传中…' : '保存订阅到 Secret'"></span>
           </button>
+          <label class="flex items-center gap-1.5 cursor-pointer select-none"
+                 :class="singleRunIds.length === 0 ? 'opacity-40' : ''">
+            <input type="checkbox" x-model="singleRunUseOfficial"
+                   :disabled="singleRunIds.length === 0"
+                   class="w-3.5 h-3.5 rounded border-gray-300 text-emerald-500 focus:ring-emerald-400">
+            <span class="text-xs text-gray-500">官方字幕</span>
+          </label>
           <button @click="runSingleRunWorkflow()" :disabled="singleRunTriggering || singleRunIds.length === 0"
                   class="px-5 py-2.5 bg-emerald-500 text-white rounded-lg text-sm font-medium hover:bg-emerald-600 disabled:opacity-50 flex items-center gap-2">
             <div x-show="singleRunTriggering" class="spinner !w-4 !h-4 !border-2 !border-white/30 !border-t-white"></div>
@@ -867,7 +877,7 @@
     </div>
 
     <div class="px-4 py-2 bg-blue-50 border-t border-blue-100 text-xs text-blue-800 leading-relaxed space-y-1">
-      <p>[MD] <strong>复制 Markdown</strong>：合并转录+摘要到剪贴板，纯浏览器端操作，无需网络。</p>
+      <p>[MD] <strong>复制 Markdown</strong>：导出所选课次的摘要到剪贴板，纯浏览器端操作，无需网络。</p>
       <p>[PDF] <strong>触发后台导出</strong>：通过 GitHub Actions 生成 PDF，发送到 RECEIVER_EMAIL。预计 1-3 分钟。</p>
     </div>
 

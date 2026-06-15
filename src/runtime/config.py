@@ -39,7 +39,7 @@ MODEL_PROVIDERS: list[dict] = [
         "name": "deepseek",
         "api_key_env": "DEEPSEEK_API_KEY",
         "base_url_env": "DEEPSEEK_BASE_URL",
-        "default_base_url": "https://api.deepseek.com",
+        "default_base_url": "https://api.deepseek.com/v1",
         "models": [
             "deepseek-v4-pro"
             "deepseek-v4-flash"
@@ -163,6 +163,12 @@ OCR_MAX_TARGET = int(os.environ.get("OCR_MAX_TARGET", "2"))
 # at 20 MB/s split = ~10 MB/s each.
 VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
+)
+
+# 是否优先使用 iCourse 官方字幕（跳过 ASR 转录）。默认关闭。
+USE_OFFICIAL_TRANSCRIPT = (
+    os.environ.get("USE_OFFICIAL_TRANSCRIPT", "").strip().lower()
+    in ("1", "true", "yes")
 )
 
 # 监控的课程 ID 列表

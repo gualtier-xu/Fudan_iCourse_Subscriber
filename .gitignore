@@ -6,7 +6,7 @@ data/*
 *.mp4
 *.wav
 tests/
-
+temp/
 # ASR models (downloaded at runtime)
 sherpa-onnx-sense-voice-*/
 sherpa-onnx-fire-red-*/

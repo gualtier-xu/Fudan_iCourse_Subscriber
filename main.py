@@ -7,9 +7,8 @@ AudioDownloader.  This file does only orchestration:
   1. Build all components.
   2. Login + enumerate.
   3. Drive LectureRunner across the queued lectures.
-  4. Resummarize old (pre-v2) lectures.
-  5. Email + bookkeeping.
-  6. Shutdown.
+  4. Email + bookkeeping.
+  5. Shutdown.
 
 Anything more interesting belongs in one of ``src/*`` modules.
 """
@@ -30,7 +29,7 @@ from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
 
 
-def login_with_retry(max_attempts: int = 5) -> WebVPNSession:
+def login_with_retry(max_attempts: int = 10) -> WebVPNSession:
     """Login to WebVPN + iCourse CAS, retrying on transient failures.
 
     The iCourse CAS step (authenticate_icourse) has its own inner retry
@@ -91,16 +90,27 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
 
             # School system sometimes lists duplicate lectures; dedup the
             # raw list so the same logic produces the same outcome each run.
-            seen_sub_titles: set[str] = set()
+            # When a sub_title appears more than once, keep the first one
+            # that has playback; if none have playback, keep the first.
+            seen_sub_titles: dict[str, dict] = {}
             deduped = []
             for lec in lectures:
                 title = lec.get("sub_title", "")
-                if title and title in seen_sub_titles:
-                    reporter.course_dedup_skip(title, lec["sub_id"])
+                if not title:
+                    deduped.append(lec)
                     continue
-                if title:
-                    seen_sub_titles.add(title)
-                deduped.append(lec)
+                existing = seen_sub_titles.get(title)
+                if existing is None:
+                    seen_sub_titles[title] = lec
+                    deduped.append(lec)
+                elif not existing.get("has_playback") and lec.get("has_playback"):
+                    # replace the earlier no-playback entry in place so the
+                    # processing order stays chronological
+                    deduped[deduped.index(existing)] = lec
+                    seen_sub_titles[title] = lec
+                    reporter.course_dedup_skip(title, existing["sub_id"])
+                else:
+                    reporter.course_dedup_skip(title, lec["sub_id"])
             lectures = deduped
 
             known_processed = db.get_processed_sub_ids(course_id)
@@ -149,12 +159,12 @@ def _drive_lectures(client: ICourseClient, db: Database,
     if not all_lectures:
         return
 
-    first_course, _, first_lec = all_lectures[0]
-    scheduler.prefetch_lecture(client, first_course, str(first_lec["sub_id"]))
-
     runner = LectureRunner(
         client, db, scheduler, transcriber, summarizer, reporter,
     )
+
+    first_course, _, first_lec = all_lectures[0]
+    runner.prefetch_first(first_course, str(first_lec["sub_id"]))
 
     for i, (course_id, course_title, lecture) in enumerate(all_lectures):
         sub_id = str(lecture["sub_id"])

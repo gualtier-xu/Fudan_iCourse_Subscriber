@@ -282,6 +282,7 @@ document.addEventListener("alpine:init", () => {
     _subsFilterTimer: null, _deptFilterTimer: null,
     subsSaving: false, subsError: "",
     singleRunTriggering: false,
+    singleRunUseOfficial: false,
     /* Per-browser pinned-courses set, lazily synced to localStorage. */
     starred: _loadStarred(),
 
@@ -329,11 +330,8 @@ document.addEventListener("alpine:init", () => {
           );
         }
 
-        var sorted = this._sortCoursesByStar(ICS.db.getCourses());
-        this.courses = sorted;
+        this.courses = this._sortCoursesByStar(ICS.db.getCourses());
         this.view = "courses";
-        var self = this;
-        this.$nextTick(function () { self.courses = self._sortCoursesByStar(self.courses); });
       } catch (e) {
         this.error = e.message;
         this.view = "error";
@@ -360,6 +358,20 @@ document.addEventListener("alpine:init", () => {
         this.currentPptPages = this.currentLecture
           ? ICS.db.getPptPages(this.currentLecture.sub_id)
           : [];
+        // Opening from search lands here without a matching course context;
+        // load the lecture's own course so prev/next nav + the lectures list
+        // (used by _currentLectureIndex) are correct rather than stale/empty.
+        if (this.currentLecture) {
+          var cid = String(this.currentLecture.course_id);
+          if (!this.currentCourse || String(this.currentCourse.course_id) !== cid) {
+            this.currentCourse =
+              this.courses.find((x) => String(x.course_id) === cid)
+              || { course_id: cid,
+                   title: this.currentLecture.course_title || "",
+                   teacher: this.currentLecture.teacher || "" };
+            this.lectures = ICS.db.getLectures(cid);
+          }
+        }
         this.detailView = "summary";
       }
       this.view = view;
@@ -386,8 +398,9 @@ document.addEventListener("alpine:init", () => {
     openLecture(id) { this.navigate("detail", { subId: id }); },
 
     /* Prev/next within the current course's lecture list.  Lectures are
-       ordered ascending by sub_id (matches the lectures view), so "prev"
-       is the lecture at index-1 and "next" is at index+1. */
+       ordered chronologically (parsed from sub_title; see db.js
+       _lectureOrderKey), matching the lectures view, so "prev" is the
+       lecture at index-1 and "next" is at index+1. */
     _currentLectureIndex() {
       if (!this.currentLecture || !this.lectures) return -1;
       return this.lectures.findIndex(
@@ -539,12 +552,6 @@ document.addEventListener("alpine:init", () => {
           lines.push(lec.summary);
           lines.push("");
         }
-        if (lec.transcript) {
-          lines.push("### 转录文本");
-          lines.push("");
-          lines.push(lec.transcript);
-          lines.push("");
-        }
         lines.push("---");
         lines.push("");
       }
@@ -598,7 +605,6 @@ document.addEventListener("alpine:init", () => {
         this._toast("未登录或 PAT 缺失", "error");
         return;
       }
-      if (!confirm("确定要删除选中的 " + selected.length + " 节课吗？此操作不可撤销。")) return;
       this.deletingCourses = true;
       try {
         var currentCid = this.currentCourse ? String(this.currentCourse.course_id) : null;
@@ -983,7 +989,7 @@ document.addEventListener("alpine:init", () => {
         // than overloading the scheduled check workflow.
         await ICS.github.triggerSingleRunWorkflow(
           this.repoOwner, this.repoName, "main", creds.token,
-          this.singleRunIds,
+          this.singleRunIds, this.singleRunUseOfficial,
         );
         this._toast(
           "已触发单次运行，处理 " + this.singleRunIds.length + " 门课。请到 Actions 查看进度",

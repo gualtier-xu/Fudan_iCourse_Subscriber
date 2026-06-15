@@ -83,9 +83,10 @@ The strategy:
 
     2. Otherwise — read the previously persisted value from
        ``meta('subscribed_course_ids')``.  ``single_run.yml``,
-       ``reshard.yml``, and manual reshards take this path; they would
-       otherwise be at risk of treating their one-shot ``COURSE_IDS``
-       input as the full subscription and corrupting the bin layout.
+       ``delete_course.yml``, and manual reshards take this path; they
+       would otherwise be at risk of treating their one-shot
+       ``COURSE_IDS`` input as the full subscription and corrupting the
+       bin layout.
 
 LAYOUT under ``output_dir``
 ===========================

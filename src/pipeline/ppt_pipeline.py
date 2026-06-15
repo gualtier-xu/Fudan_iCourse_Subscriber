@@ -2,16 +2,19 @@
 
 Two consumption patterns share the same four stages:
 
-  PPTPipeline.submit(...)        → returns a ``PPTAsyncHandle`` that holds
-                                   in-flight OCR ``Future`` s.  Caller (the
-                                   LectureRunner) does ASR transcription in
-                                   parallel, then calls ``handle.drain()`` to
-                                   block for stats.
-  PPTPipeline.run_blocking(...)  → ``submit`` + immediate ``drain``.  Used by
-                                   the resummarize path where there is no
-                                   accompanying ASR to overlap with.
+  PPTPipeline.submit(...)          → returns a ``PPTAsyncHandle`` that holds
+                                     in-flight OCR ``Future`` s.  Caller (the
+                                     LectureRunner) does ASR transcription in
+                                     parallel, then calls ``handle.drain()`` to
+                                     block for stats.  With ``defer_ocr=True``
+                                     the OCR jobs are submitted by ``drain``
+                                     itself, so ASR keeps the CPU to itself.
+  PPTPipeline.prefetch_and_ocr(...) → same stages for the *next* lecture,
+                                     kicked off while the current lecture
+                                     waits on the LLM.  The next ``submit``
+                                     call absorbs whatever it finished.
 
-The four stages are identical in both paths:
+The four stages are identical in both paths (``_collect_survivors``):
 
   1. Fetch the PPT list from iCourse and ``INSERT OR IGNORE`` each row into
      ``ppt_pages`` with ``ocr_status='pending'``.  Idempotent — safe to call
@@ -21,14 +24,16 @@ The four stages are identical in both paths:
      ``Scheduler.image_cache`` (prefetch) first, then falls back to a sync
      ``fetch_ppt_image`` call for any pending row missing from the cache
      (typically a stale row from a prior interrupted run, or a download
-     that failed in the prefetch pool).
-  3. Sliding-window dHash dedup over the chronologically ordered pending
-     pages — losers are stamped ``dedup_dropped`` and removed before OCR.
-  4. For each survivor: submit an OCR job to ``Scheduler.submit_ocr`` (which
-     gates on the dynamic semaphore, so live concurrency tracks
-     ResourceMonitor's target).  Workers classify the OCR'd text as
-     ``invalid`` (matches one of the classroom-noise screens) or ``done``,
-     and write the row in place.
+     that failed in the prefetch pool).  Pages whose row is already
+     done/invalid/failed/dedup_dropped are never re-collected, so their
+     status can't be overwritten by a later pass.
+  3. dHash dedup over the chronologically ordered pending pages — garbage-
+     catalog matches and pairwise near-duplicates are stamped
+     ``dedup_dropped`` and removed before OCR.
+  4. For each survivor: submit an OCR job to ``Scheduler.submit_ocr`` (live
+     concurrency is capped by a fixed BoundedSemaphore).  Workers classify
+     the OCR'd text as ``invalid`` (matches one of the classroom-noise
+     screens) or ``done``, and write the row in place.
 
 ``get_done_ppt_pages`` only surfaces rows with status='done', so dropped /
 invalid / failed pages naturally drop out of the LLM prompt.
@@ -36,13 +41,14 @@ invalid / failed pages naturally drop out of the LLM prompt.
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import Future, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from src.api import icourse
 from src.ai.ocr import ocr_image_text
-from src.ai.ppt_dedup import clean_ppt_text, compute_dhash, dedup_dhash, is_invalid_page
+from src.ai.ppt_dedup import clean_ppt_text, compute_dhash, dedup_dhash, is_invalid_page, match_garbage
 
 if TYPE_CHECKING:
     from src.data.database import Database
@@ -63,7 +69,7 @@ class PPTStats:
     inserted: int    # newly registered this run
     done: int        # OCR succeeded, text kept
     invalid: int     # matched a classroom-noise pattern
-    dedupped: int    # dropped by dHash sliding-window dedup
+    dedupped: int    # dropped by garbage-catalog match or pairwise dHash dedup
     failed: int      # download or OCR error
 
 
@@ -154,150 +160,166 @@ class PPTPipeline:
         # Keyed by sub_id; submit() drains them before starting ASR if the
         # pre-submitted OCR hasn't completed yet.
         self._prefetched_ocr: dict[str, list[Future]] = {}
+        # The background threads driving prefetch_and_ocr, keyed by sub_id.
+        # submit() joins the thread before reading _prefetched_ocr, which
+        # is also what makes the dict handoff thread-safe.
+        self._prefetch_threads: dict[str, threading.Thread] = {}
 
     # ── Public entry points ─────────────────────────────────────────────
 
     def submit(self, client: "ICourseClient", course_id: str,
                sub_id: str, *, defer_ocr: bool = False) -> PPTAsyncHandle:
-        """Stages 1-3 run inline; stage 4 (OCR) is submitted to the pool.
+        """Stages 1-3 run inline; stage 4 (OCR) goes to the pool — either
+        immediately, or at ``drain()`` time when ``defer_ocr=True``.
 
-        Returns immediately with a handle so the caller can do ASR (or any
-        other long parallel work) before draining.  After this call returns
-        the prefetch cache entry has been ``discard``-ed; the OCR workers
-        hold the image bytes they need via closure capture.
+        Returns a handle so the caller can do ASR (or any other long
+        parallel work) before draining.  After this call returns the
+        prefetch cache entry has been ``discard``-ed; the OCR workers hold
+        the image bytes they need via closure capture.
         """
         sub_id = str(sub_id)
 
-        # Stage 1 — register pending rows from the current PPT list.
-        # Prefetch may already have been scheduled by the previous lecture;
-        # ``schedule`` is idempotent so this is safe either way.
-        self._scheduler.image_cache.schedule(client, course_id, sub_id)
-        ppt_items, images = self._scheduler.image_cache.wait(sub_id)
+        # If prefetch_and_ocr ran during the previous lecture's LLM phase,
+        # wait for whatever it managed to start.  Pages it already OCR'd
+        # are no longer 'pending'; anything it didn't get to still is, and
+        # _collect_survivors picks those up below.
+        self._join_prefetch(sub_id)
 
-        inserted = 0
-        if ppt_items:
-            inserted = self._db.insert_ppt_pages_pending(sub_id, ppt_items)
-        total = self._db.count_total_ppt_pages(sub_id)
-        if self._reporter and (inserted or total):
-            self._reporter.ppt_pages_registered(total, inserted)
+        images, c = self._collect_survivors(client, course_id, sub_id)
+        if self._reporter and (c["inserted"] or c["total"]):
+            self._reporter.ppt_pages_registered(c["total"], c["inserted"])
 
-        # Stage 2 — assemble images for every still-pending row.
-        # The DB may include stale pending rows from a prior interrupted
-        # run that aren't in the current prefetch.  Re-download those in
-        # the main thread (rare path, kept simple).
-        pending = self._db.get_pending_ppt_pages(sub_id)
-        # If prefetch_and_ocr submitted OCR in the previous lecture's LLM
-        # phase, drain those futures before proceeding (OCR may still be
-        # running if the LLM returned early).  After draining, re-query
-        # pending so any pages the API exposed *after* prefetch ran (rare,
-        # but possible if the lecturer adds slides mid-recording) are still
-        # processed instead of silently dropped.
-        pre_futs = self._prefetched_ocr.pop(sub_id, None)
-        if pre_futs:
-            for fut in as_completed(pre_futs):
-                try:
-                    fut.result()
-                except Exception:
-                    pass
-            pending = self._db.get_pending_ppt_pages(sub_id)
-        presubmit_failed = 0
-        for p in pending:
-            page_num = p["page_num"]
-            if page_num in images:
-                continue
-            img = icourse.fetch_ppt_image(client, p)
-            if img is None:
-                self._db.update_ppt_page(sub_id, page_num, None, "failed")
-                presubmit_failed += 1
-            else:
-                images[page_num] = img
-
-        # Stage 3 — dHash + sliding-window dedup over chronologically
-        # ordered pending rows.  Dhash is also persisted for later
-        # diagnostics (e.g. inspecting dedup decisions across runs).
-        dhashes_in_order: list[str | None] = []
-        page_at_index: list[int] = []
-        for p in pending:
-            page_num = p["page_num"]
-            img = images.get(page_num)
-            if img is None:
-                continue
-            dh = compute_dhash(img)
-            self._db.update_ppt_page_dhash(sub_id, page_num, dh)
-            dhashes_in_order.append(dh)
-            page_at_index.append(page_num)
-
-        dropped_idx = dedup_dhash(dhashes_in_order)
-        dropped_pages = {page_at_index[i] for i in dropped_idx}
-        for page_num in dropped_pages:
-            self._db.update_ppt_page(sub_id, page_num, None, "dedup_dropped")
-            images.pop(page_num, None)
-
-        # Stage 4 — optionally submit OCR.  When defer_ocr=True, OCR is
-        # skipped now and submitted lazily in handle.drain() to avoid
-        # CPU contention with ASR (the caller runs ASR between submit
-        # and drain).
-        keep_images: dict[int, bytes] = {
-            pn: img for pn, img in images.items() if pn not in dropped_pages
-        }
+        # Stage 4 — optionally submit OCR.
         futures: list[Future] = []
-        if not defer_ocr:
-            if self._reporter and keep_images:
-                self._reporter.ocr_progress_start(sub_id, len(keep_images))
-            for page_num, img in keep_images.items():
+        if not defer_ocr and images:
+            if self._reporter:
+                self._reporter.ocr_progress_start(sub_id, len(images))
+            for page_num, img in images.items():
                 futures.append(
                     self._scheduler.submit_ocr(
                         self._ocr_worker, sub_id, page_num, img,
                     )
                 )
-            keep_images = {}  # release memory; workers hold closures
+            images = {}  # release memory; workers hold closures
 
         self._scheduler.image_cache.discard(sub_id)
 
         return PPTAsyncHandle(
             self, sub_id,
-            total=total, inserted=inserted, futures=futures,
-            dedupped=len(dropped_pages),
-            presubmit_failed=presubmit_failed,
-            images=keep_images or None,
+            total=c["total"], inserted=c["inserted"], futures=futures,
+            dedupped=c["dedupped"],
+            presubmit_failed=c["failed"],
+            images=images or None,
         )
 
     def prefetch_and_ocr(self, client: "ICourseClient", course_id: str,
                           sub_id: str) -> None:
-        """Download images + dedup + submit OCR for a lecture, but DON'T
-        drain or discard the prefetch cache.
+        """Kick off download + dedup + OCR for a lecture in a background
+        thread, without draining or discarding the prefetch cache.
 
-        Designed to be called during the LLM wait of the *previous* lecture.
-        OCR runs in the background pool while the API call is in flight.
-        The subsequent ``submit()`` call for this lecture will find the
-        already-OCR'd pages in the DB and skip redundant work.
+        Designed to be called right before the LLM wait of the *previous*
+        lecture: image collection, dHash and OCR all overlap with the API
+        call instead of blocking the main thread.  Whatever hasn't finished
+        by the time the LLM returns is simply absorbed by this lecture's
+        own ``submit()`` — it joins the thread, drains the OCR futures,
+        and processes any rows that are still pending.
 
         The prefetch cache is intentionally NOT discarded here — the
         real ``submit()`` call in Phase B of the next lecture handles that.
         """
         sub_id = str(sub_id)
-        self._scheduler.image_cache.schedule(client, course_id, sub_id)
-        ppt_items, images = self._scheduler.image_cache.wait(sub_id)
-
-        if ppt_items:
-            self._db.insert_ppt_pages_pending(sub_id, ppt_items)
-
-        pending = self._db.get_pending_ppt_pages(sub_id)
-        if not pending:
+        if sub_id in self._prefetch_threads:
             return
+        t = threading.Thread(
+            target=self._prefetch_worker,
+            args=(client, course_id, sub_id),
+            name=f"ppt-prefetch-{sub_id}",
+            daemon=True,
+        )
+        self._prefetch_threads[sub_id] = t
+        t.start()
 
-        # Re-fetch any images not in the prefetch cache
+    def _prefetch_worker(self, client: "ICourseClient", course_id: str,
+                         sub_id: str) -> None:
+        try:
+            images, _ = self._collect_survivors(client, course_id, sub_id)
+            if not images:
+                return
+            if self._reporter:
+                self._reporter.ocr_progress_start(sub_id, len(images))
+            self._prefetched_ocr[sub_id] = [
+                self._scheduler.submit_ocr(self._ocr_worker, sub_id, pn, img)
+                for pn, img in images.items()
+            ]
+        except Exception as e:
+            if self._reporter:
+                self._reporter.info(
+                    f"    [Prefetch OCR] {sub_id} failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    # ── Shared stages 1-3 ───────────────────────────────────────────────
+
+    def _join_prefetch(self, sub_id: str) -> None:
+        """Wait out a prior ``prefetch_and_ocr`` for sub_id: join its
+        worker thread, then block for the OCR futures it submitted."""
+        t = self._prefetch_threads.pop(sub_id, None)
+        if t is not None:
+            t.join()
+        futs = self._prefetched_ocr.pop(sub_id, None)
+        if not futs:
+            return
+        for fut in as_completed(futs):
+            try:
+                fut.result()
+            except Exception:
+                pass  # worker already persisted 'failed' and logged
+
+    def _collect_survivors(
+        self, client: "ICourseClient", course_id: str, sub_id: str,
+    ) -> tuple[dict[int, bytes], dict]:
+        """Stages 1-3: register pages, gather images for *pending* rows
+        only, then garbage-catalog + pairwise dHash dedup.
+
+        Returns ``(images, counters)`` where ``images`` maps page_num →
+        bytes for exactly the pages that should be OCR'd next.  Pages whose
+        row is already done/invalid/failed/dedup_dropped — from a previous
+        run or a prefetch_and_ocr pass — never enter ``images``, so they
+        can't be re-OCR'd and their status can't be overwritten (a dropped
+        page must stay dropped).
+        """
+        sub_id = str(sub_id)
+
+        # Stage 1 — register pending rows from the current PPT list.
+        # ``schedule`` is idempotent; usually the previous lecture's
+        # prefetch already warmed the cache.
+        self._scheduler.image_cache.schedule(client, course_id, sub_id)
+        ppt_items, cached = self._scheduler.image_cache.wait(sub_id)
+        inserted = 0
+        if ppt_items:
+            inserted = self._db.insert_ppt_pages_pending(sub_id, ppt_items)
+        total = self._db.count_total_ppt_pages(sub_id)
+
+        # Stage 2 — image bytes for every still-pending row.  Cache first,
+        # sync re-download for stale rows from a prior interrupted run.
+        pending = self._db.get_pending_ppt_pages(sub_id)
+        images: dict[int, bytes] = {}
+        failed = 0
         for p in pending:
             pn = p["page_num"]
-            if pn in images:
-                continue
-            img = icourse.fetch_ppt_image(client, p)
-            if img:
+            img = cached.get(pn)
+            if img is None:
+                img = icourse.fetch_ppt_image(client, p)
+            if img is None:
+                self._db.update_ppt_page(sub_id, pn, None, "failed")
+                failed += 1
+            else:
                 images[pn] = img
 
-        # Dedup
+        # Stage 3 — dHash, then garbage catalog, then pairwise dedup on
+        # the survivors.
         dhashes: list[str | None] = []
-        indices: list[int] = []
+        page_at: list[int] = []
         for p in pending:
             pn = p["page_num"]
             img = images.get(pn)
@@ -306,29 +328,25 @@ class PPTPipeline:
             dh = compute_dhash(img)
             self._db.update_ppt_page_dhash(sub_id, pn, dh)
             dhashes.append(dh)
-            indices.append(pn)
+            page_at.append(pn)
 
-        dropped = {indices[i] for i in dedup_dhash(dhashes)}
-        for pn in dropped:
+        garbage_idx = set(match_garbage(dhashes))
+        survivor_items = [
+            dh for i, dh in enumerate(dhashes) if i not in garbage_idx
+        ]
+        survivor_pages = [
+            page_at[i] for i in range(len(page_at)) if i not in garbage_idx
+        ]
+        dropped_pages = {survivor_pages[i] for i in dedup_dhash(survivor_items)}
+        dropped_pages |= {page_at[i] for i in garbage_idx}
+        for pn in dropped_pages:
             self._db.update_ppt_page(sub_id, pn, None, "dedup_dropped")
             images.pop(pn, None)
 
-        # Submit OCR — store futures so submit() can drain them if they
-        # haven't completed by the time the next lecture starts.
-        ocr_pages = {pn: img for pn, img in images.items() if pn not in dropped}
-        if self._reporter and ocr_pages:
-            self._reporter.ocr_progress_start(sub_id, len(ocr_pages))
-        futures = [
-            self._scheduler.submit_ocr(self._ocr_worker, sub_id, pn, img)
-            for pn, img in ocr_pages.items()
-        ]
-        if futures:
-            self._prefetched_ocr[sub_id] = futures
-
-    def run_blocking(self, client: "ICourseClient", course_id: str,
-                     sub_id: str) -> PPTStats:
-        """submit() then drain(); convenient for callers with no parallel work."""
-        return self.submit(client, course_id, sub_id).drain()
+        return images, {
+            "total": total, "inserted": inserted,
+            "failed": failed, "dedupped": len(dropped_pages),
+        }
 
     # ── Worker ──────────────────────────────────────────────────────────
 
@@ -336,7 +354,7 @@ class PPTPipeline:
                     image_bytes: bytes) -> tuple[int, str]:
         """OCR one image, classify, persist. Returns (page_num, status).
 
-        Runs in the OCR pool (gated by the dynamic semaphore).  Database
+        Runs in the OCR pool (gated by a fixed BoundedSemaphore).  Database
         writes go through ``Database._lock`` so concurrent workers don't
         race on the same row.
 

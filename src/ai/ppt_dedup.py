@@ -1,22 +1,18 @@
-"""PPT page filters: perceptual-hash dedup + multi-pattern invalid-page match.
+"""PPT page filters: garbage-catalog matching + perceptual-hash dedup.
 
 All configurable rules live in ``ppt_dedup_config.py`` — edit that file to
 tune patterns without touching this logic code.
 
-Pipeline (both stages run from main.py's ``_fetch_and_ocr_ppts``):
+Pipeline (pre-OCR stages):
+  1. ``match_garbage`` — compares each page's dhash against a pre-computed
+     garbage catalog; matches are dropped before OCR (no text needed).
+  2. ``dedup_dhash`` — full pairwise dedup on survivors, with auto-escalating
+     threshold capped at ``DHASH_MAX_SURVIVORS``.
 
-1. ``compute_dhash`` / ``dedup_dhash`` — pre-OCR, drops near-duplicate
-   frames using perceptual hashing so the OCR pass runs on fewer images.
-
-2. ``is_invalid_page`` — post-OCR, discards pages whose text matches known
-   full-screen noise (desktop wallpaper, e-learning portal, file explorer, etc.)
-
-3. ``clean_ppt_text`` — post-invalidation, strips per-line UI chrome labels
-   (PowerPoint ribbon, IDE panels, system dialogs, etc.) from surviving pages.
-
-4. ``dedup_text_subset`` — post-cleaning, removes pages whose text is a
-   near-subset of a nearby page (PPT animation reveals, progressive bullet
-   disclosure).
+Post-OCR stages:
+  3. ``is_invalid_page`` — text-based noise detection.
+  4. ``clean_ppt_text`` — per-line UI chrome stripping.
+  5. ``dedup_text_subset`` — text n-gram subset dedup for animation reveals.
 """
 
 from __future__ import annotations
@@ -30,7 +26,9 @@ from PIL import Image
 
 from src.ai.ppt_dedup_config import (
     DHASH_THRESHOLD,
-    DHASH_WINDOW,
+    DHASH_MAX_SURVIVORS,
+    GARBAGE_CATALOG,
+    GARBAGE_THRESHOLD,
     INVALID_PAGE_PATTERNS,
     PPT_UI_STOPWORDS,
     SUBSET_CONFIG,
@@ -47,19 +45,15 @@ _NORMALIZE_UI_RE = re.compile(r"[\s　]+")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 1 — PHASH dedup  (pre-OCR)
+# Stage 1 — Garbage-catalog matching  (pre-OCR)
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Pre-convert catalog hex strings to ints at import time.
+_GARBAGE_INTS: list[int] = [int(h, 16) for h in GARBAGE_CATALOG]
 
 
 def compute_dhash(image_bytes: bytes) -> str | None:
-    """Perceptual hash for an image. Returns 16-hex string or None on error.
-
-    Uses imagehash.dhash (8x8 difference hash). Identical/near-identical
-    crops yield identical hashes; visually distinct frames almost always
-    differ by more than 4 bits.  Caller must tolerate ``None`` (image
-    decode failure, missing PIL, etc.) — those pages are excluded from
-    the dedup pass and pass through to OCR untouched.
-    """
+    """Perceptual hash for an image. Returns 16-hex string or None on error."""
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
             return str(imagehash.dhash(img))
@@ -67,55 +61,90 @@ def compute_dhash(image_bytes: bytes) -> str | None:
         return None
 
 
-def _hamming_hex(a: str, b: str) -> int:
-    return bin(int(a, 16) ^ int(b, 16)).count("1")
+def match_garbage(
+    items: list[str | None],
+    threshold: int | None = None,
+) -> list[int]:
+    """Match each page against the garbage catalog.  Returns sorted list of
+    indices that matched (i.e. should be dropped as known garbage).
+
+    ``items`` may contain ``None`` (compute_dhash failure) — those are
+    passed through (never matched).
+    """
+    if threshold is None:
+        threshold = GARBAGE_THRESHOLD
+    matched: list[int] = []
+    for i, h in enumerate(items):
+        if h is None:
+            continue
+        dh = int(h, 16)
+        for ref in _GARBAGE_INTS:
+            if (dh ^ ref).bit_count() <= threshold:
+                matched.append(i)
+                break
+    return matched
+
+
+def _dedup_full(
+    items: list[str | None],
+    threshold: int,
+) -> set[int]:
+    """Full pairwise dedup. Anchor-based: for each surviving page i, drop
+    all later pages j whose dhash is within ``threshold`` Hamming bits of i.
+    Already-dropped pages never become anchors."""
+    n = len(items)
+    dropped: set[int] = set()
+    # Pre-convert to int for fast XOR
+    int_items: list[int | None] = []
+    for h in items:
+        int_items.append(int(h, 16) if h else None)
+    for i in range(n):
+        if i in dropped:
+            continue
+        a = int_items[i]
+        if a is None:
+            continue
+        for j in range(i + 1, n):
+            if j in dropped:
+                continue
+            b = int_items[j]
+            if b is None:
+                continue
+            if (a ^ b).bit_count() <= threshold:
+                dropped.add(j)
+    return dropped
 
 
 def dedup_dhash(
     items: list[str | None],
-    window: int = DHASH_WINDOW,
-    threshold: int = DHASH_THRESHOLD,
+    window: int = 0,
+    threshold: int | None = None,
+    max_survivors: int | None = None,
 ) -> list[int]:
-    """Sliding-window perceptual dedup. Returns sorted list of dropped indices.
+    """Full pairwise dedup with auto-escalating threshold (Step 2).
 
-    For each surviving anchor i, scan forward collecting at most ``window``
-    *non-dropped* items to compare against.  When the scan finds a match the
-    matched index is dropped and the window automatically "fills forward" (the
-    dropped slot is replaced by the next non-dropped item beyond the current
-    window boundary).  This makes the dedup more aggressive than a fixed-position
-    window since dropped items don't reduce the number of actual comparisons.
+    Runs after ``match_garbage``.  Starts at ``DHASH_THRESHOLD`` (3),
+    drops near-duplicate pages via full pairwise anchor-based comparison,
+    then auto-raises the threshold in steps of 4 until survivors ≤
+    ``DHASH_MAX_SURVIVORS`` (150).
 
-    Already-dropped images never become anchors — that prevents a chain of "near
-    to last-kept" pages from cascading drops onto pages that aren't actually near
-    the kept anchor.
-
-    ``items`` may contain ``None`` (compute_dhash failure) — those indices are
-    passed through (never dropped, never used as anchor).
+    Returns sorted list of dropped indices (within the ``items`` list).
     """
+    if threshold is None:
+        threshold = DHASH_THRESHOLD
+    if max_survivors is None:
+        max_survivors = DHASH_MAX_SURVIVORS
+    del window  # deprecated, kept for signature compatibility
+
     n = len(items)
-    dropped: set[int] = set()
-    for i in range(n):
-        if i in dropped:
-            continue
-        a = items[i]
-        if a is None:
-            continue
-        cmp_count = 0
-        j = i + 1
-        while cmp_count < window and j < n:
-            if j in dropped:
-                j += 1
-                continue
-            b = items[j]
-            if b is None:
-                j += 1
-                continue
-            if _hamming_hex(a, b) <= threshold:
-                dropped.add(j)
-                # dropped slot is replaced by next non-dropped item
-            else:
-                cmp_count += 1
-            j += 1
+    dropped = _dedup_full(items, threshold)
+    survivors = n - len(dropped)
+
+    while survivors > max_survivors and threshold < 50:
+        threshold += 4
+        dropped = _dedup_full(items, threshold)
+        survivors = n - len(dropped)
+
     return sorted(dropped)
 
 

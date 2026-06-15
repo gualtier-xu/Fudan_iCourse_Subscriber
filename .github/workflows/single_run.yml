@@ -7,6 +7,11 @@ on:
         description: "Comma-separated course IDs to process (e.g. 30004,30005)"
         required: true
         type: string
+      use_official_transcript:
+        description: "Use official iCourse transcripts instead of ASR"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -157,12 +162,19 @@ jobs:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ inputs.course_ids }}
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          USE_OFFICIAL_TRANSCRIPT: ${{ inputs.use_official_transcript && '1' || '' }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-        run: python -u main.py
+          # All secrets, JSON-encoded. provider_env.py exports only the
+          # vars named by config.MODEL_PROVIDERS (api_key_env /
+          # base_url_env), so user-defined providers with custom env-var
+          # names work without editing this workflow.
+          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+        run: |
+          eval "$(python scripts/provider_env.py)"
+          unset SECRETS_CONTEXT
+          python -u main.py
 
       - name: Deploy database to data branch
         if: always()

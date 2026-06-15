@@ -168,13 +168,18 @@ jobs:
           UISPsw: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ secrets.COURSE_IDS }}
           CRAWL_TERM: ${{ secrets.CRAWL_TERM }}
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-        run: python -u main.py
+          # All secrets, JSON-encoded. provider_env.py exports only the
+          # vars named by config.MODEL_PROVIDERS (api_key_env /
+          # base_url_env), so user-defined providers with custom env-var
+          # names work without editing this workflow.
+          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+        run: |
+          eval "$(python scripts/provider_env.py)"
+          unset SECRETS_CONTEXT
+          python -u main.py
 
       - name: Deploy database to data branch
         if: always()
@@ -183,9 +188,9 @@ jobs:
           UISPSW: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ secrets.COURSE_IDS }}
           # Persisted by the sharder into meta('subscribed_course_ids')
-          # so single_run.yml / reshard.yml (which run with a different
-          # COURSE_IDS) still know the user's real subscription and
-          # don't reclassify everything as cold.
+          # so single_run.yml / delete_course.yml (which run with a
+          # different or no COURSE_IDS) still know the user's real
+          # subscription and don't reclassify everything as cold.
           SUBSCRIBED_COURSE_IDS: ${{ secrets.COURSE_IDS }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}

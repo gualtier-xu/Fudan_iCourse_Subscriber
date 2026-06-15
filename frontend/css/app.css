@@ -50,6 +50,7 @@
 .badge-ready      { background: #e8f5e9; color: #2e7d32; }
 .badge-processing { background: #fff3e0; color: #e65100; }
 .badge-waiting    { background: #f3f4f6; color: #6b7280; }
+.badge-skipped    { background: #f1f5f9; color: #94a3b8; }
 .badge-failed     { background: #ffebee; color: #c62828; }
 
 /* View transitions */
